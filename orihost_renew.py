@@ -182,7 +182,7 @@ def renew_server(cookie: str, server_id: str) -> dict:
 
     Orihost 续期流程（需要在面板点击 Read Article 后等待再 Claim）：
       1. POST /api/client/servers/{server}/renew/begin
-         → 返回 {url: "文章链接", dwell_seconds: 15}，启动续期会话
+         → 返回 {url: "文章链接", dwell_seconds: 30}，启动续期会话
       2. 等待 dwell_seconds 秒（模拟阅读文章）
       3. GET  /api/client/renewal/complete
          → 返回 {renewed_count: N, skipped_count: M}，完成续期
@@ -224,7 +224,7 @@ def renew_server(cookie: str, server_id: str) -> dict:
         return {"status": "error", "message": "begin 响应解析失败"}
 
     article_url = data.get("url", "")
-    dwell_seconds = data.get("dwell_seconds", 15)
+    dwell_seconds = data.get("dwell_seconds", 30)
     print(f"  📰 文章: {article_url}")
     print(f"  ⏳ 等待 {dwell_seconds} 秒（模拟阅读文章）...")
     time.sleep(dwell_seconds + 1)
