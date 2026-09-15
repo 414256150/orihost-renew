@@ -2,8 +2,8 @@ name: Orihost Auto Renew
 
 on:
   schedule:
-    # 每 3 天一次，UTC 10:00 = 北京时间 18:00
-    - cron: '0 10 */3 * *'
+    # 每 3 天一次，UTC 22:35 = 北京时间 6:35
+    - cron: '35 22 */3 * *'
   workflow_dispatch:  # 支持手动触发
 
 jobs:
