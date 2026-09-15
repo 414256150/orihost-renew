@@ -224,7 +224,7 @@ def renew_server(cookie: str, server_id: str) -> dict:
         return {"status": "error", "message": "begin 响应解析失败"}
 
     article_url = data.get("url", "")
-    dwell_seconds = data.get("dwell_seconds", 15)
+    dwell_seconds = data.get("dwell_seconds", 30)
     print(f"  📰 文章: {article_url}")
     print(f"  ⏳ 等待 {dwell_seconds} 秒（模拟阅读文章）...")
     time.sleep(dwell_seconds + 1)
