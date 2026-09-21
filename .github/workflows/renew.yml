@@ -1,49 +1,45 @@
-name: Auto Renew Orihost
+name: Orihost Auto Renew
 
 on:
   schedule:
-    - cron: '0 7 * * *' # 每天UTC 7点（北京时间15点）巡检一次，周期按面板文案再调
+    # 每 3 天一次，UTC 10:00 = 北京时间 18:00（7 天有效期，提前续避免删机）
+    - cron: '0 10 */3 * *'
   workflow_dispatch:
 
 jobs:
-  Renew-orihost:
+  renew:
     runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
-
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-
-      - name: ⚙ 设置 Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-
-      - name: 🛠️ 安装依赖
-        run: pip install requests
-
-      - name: 🚀 运行续期脚本（纯 HTTP，无浏览器）
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: ⚙ 设置代理 (sing-box)
+        continue-on-error: true
         env:
-          API_KEY: ${{ secrets.API_KEY }}
-          SERVER_ID: ${{ secrets.SERVER_ID }}
-          COOKIE: ${{ secrets.COOKIE }}
-          EMAIL: ${{ secrets.EMAIL }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+      - name: Run renew
+        env:
+          ORIHOST_REMEMBER: ${{ secrets.ORIHOST_REMEMBER }}
+          ORIHOST_SERVER_IDS: ${{ secrets.ORIHOST_SERVER_IDS }}
+          ORIHOST_REMEMBER_1: ${{ secrets.ORIHOST_REMEMBER_1 }}
+          ORIHOST_SERVER_IDS_1: ${{ secrets.ORIHOST_SERVER_IDS_1 }}
+          ORIHOST_REMEMBER_2: ${{ secrets.ORIHOST_REMEMBER_2 }}
+          ORIHOST_SERVER_IDS_2: ${{ secrets.ORIHOST_SERVER_IDS_2 }}
+          ORIHOST_REMEMBER_3: ${{ secrets.ORIHOST_REMEMBER_3 }}
+          ORIHOST_SERVER_IDS_3: ${{ secrets.ORIHOST_SERVER_IDS_3 }}
+          # 兼容旧变量名（完整 Cookie 串）
+          ORIHOST_COOKIE: ${{ secrets.ORIHOST_COOKIE }}
+          ORIHOST_COOKIE_1: ${{ secrets.ORIHOST_COOKIE_1 }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python3 app.py
-
-      - name: 🧹 清理旧的工作流运行记录
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
-          count=0
-          for run_id in $runs; do
-            count=$((count + 1))
-            if [ $count -gt 1 ]; then
-              echo "删除运行记录: $run_id"
-              gh run delete $run_id || true
-            fi
-          done
+          ORIHOST_PROXY: ${{ secrets.ORIHOST_PROXY }}
+          RENEWAL_MAX: '21'
+          MAX_ATTEMPTS: '5'
+        run: python orihost_renew.py
