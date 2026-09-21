@@ -1,0 +1,49 @@
+name: Auto Renew Orihost
+
+on:
+  schedule:
+    - cron: '0 7 * * *' # 每天UTC 7点（北京时间15点）巡检一次，周期按面板文案再调
+  workflow_dispatch:
+
+jobs:
+  Renew-orihost:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: ⚙ 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: 🛠️ 安装依赖
+        run: pip install requests
+
+      - name: 🚀 运行续期脚本（纯 HTTP，无浏览器）
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
+          SERVER_ID: ${{ secrets.SERVER_ID }}
+          COOKIE: ${{ secrets.COOKIE }}
+          EMAIL: ${{ secrets.EMAIL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python3 app.py
+
+      - name: 🧹 清理旧的工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
