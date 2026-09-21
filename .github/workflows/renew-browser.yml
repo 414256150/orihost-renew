@@ -1,17 +1,18 @@
-name: Orihost Auto Renew
+name: Orihost Browser Renew
 
+# 主力续期流（真浏览器）：
+# 纯 HTTP 调 complete 无 Turnstile token 直接 500，必须走浏览器：
+# Cookie 免登 → Renew Now → Read Article（新标签读文章）→ 倒计时 → Turnstile → Claim Renewal
 on:
-  # ⏸ HTTP 版已停用：complete 接口强制要 Turnstile token，纯 HTTP 无 token 直接 500。
-  # 主力请用 renew-browser.yml；本工作流仅留手动触发做查询探活。
-  # schedule:
-  #   # 每 3 天一次，UTC 10:00 = 北京时间 18:00（7 天有效期，提前续避免删机）
-  #   - cron: '0 10 */3 * *'
+  schedule:
+    # 每 3 天一次，UTC 10:00 = 北京时间 18:00（7 天有效期，提前续避免删机）
+    - cron: '0 10 */3 * *'
   workflow_dispatch:
 
 jobs:
-  renew:
+  renew-browser:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Setup Python
@@ -19,14 +20,15 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install seleniumbase
       - name: ⚙ 设置代理 (sing-box)
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-      - name: Run renew
+      - name: Run browser renew (xvfb)
         env:
           ORIHOST_REMEMBER: ${{ secrets.ORIHOST_REMEMBER }}
           ORIHOST_SERVER_IDS: ${{ secrets.ORIHOST_SERVER_IDS }}
@@ -42,6 +44,13 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           ORIHOST_PROXY: ${{ secrets.ORIHOST_PROXY }}
-          RENEWAL_MAX: '21'
-          MAX_ATTEMPTS: '5'
-        run: python orihost_renew.py
+          ARTICLE_WAIT: '30'
+          CLAIM_TIMEOUT: '150'
+        run: xvfb-run -a python orihost_browser_renew.py
+      - name: 📸 上传失败截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orihost-fail-shots
+          path: '*.png'
+          if-no-files-found: ignore
