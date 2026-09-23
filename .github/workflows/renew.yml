@@ -4,8 +4,8 @@ on:
   # ⏸ HTTP 版已停用：complete 接口强制要 Turnstile token，纯 HTTP 无 token 直接 500。
   # 主力请用 renew-browser.yml；本工作流仅留手动触发做查询探活。
   # schedule:
-  #   # 每 3 天一次，UTC 10:00 = 北京时间 18:00（7 天有效期，提前续避免删机）
-  #   - cron: '0 10 */3 * *'
+  #   # 每 3 天一次，UTC 10:00 = 北京时间 6:00（7 天有效期，提前续避免删机）
+  #   - cron: '0 22 */3 * *'
   workflow_dispatch:
 
 jobs:
