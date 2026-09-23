@@ -274,49 +274,39 @@ def ts_click_cdp(sb, x, y):
         return "cdp-err:" + str(e)[:60]
 
 
-def _wait_turnstile_token(sb, timeout=TURNSTILE_TOKEN_WAIT):
-    """等待 Turnstile token 真正写入 DOM。"""
-    deadline = time.time() + timeout
-    last_len = 0
-    while time.time() < deadline:
-        try:
-            info, _ = ts_info(sb)
-            if info:
-                token = info.get("token")
-                if isinstance(token, int):
-                    last_len = token
-                    if token > 20:
-                        print(f"  ✅ Turnstile token 已生成，长度 {token}")
-                        return True
-        except Exception:
-            pass
-        time.sleep(TURNSTILE_POLL_INTERVAL)
-    print(f"  ⚠️ Turnstile 等待超时，最后 token 长度 {last_len}")
-    return False
+def _uc_gui_turnstile(sb):
+    """优先使用 SeleniumBase/undetected-chromedriver 的 GUI CAPTCHA 点击器。
 
+    这是 Host Ship 项目已经采用的路径。它不依赖我们自己从主文档里定位
+    Cloudflare iframe，因此可以覆盖 iframe/shadow DOM/动态渲染导致的定位失败。
+    """
+    try:
+        fn = getattr(sb, "uc_gui_click_captcha", None)
+        if not callable(fn):
+            return False, "uc_gui_click_captcha 不可用"
 
-def _turnstile_click_points(rect):
-    """根据 iframe 位置生成几个安全的 checkbox 点击点。"""
-    x, y, w, h = [float(v) for v in rect[:4]]
-    cy = y + max(h / 2, 16)
-    points = [(x + 24, cy), (x + 30, y + max(h / 2, 20))]
-    result, seen = [], set()
-    for px, py in points:
-        key = (round(px, 1), round(py, 1))
-        if px > 0 and py > 0 and key not in seen:
-            seen.add(key)
-            result.append((px, py))
-    return result
+        print("  🖱️ 尝试 SeleniumBase uc_gui_click_captcha() ...")
+        result = fn()
+        print(f"    uc_gui_click_captcha 返回: {result!r}")
+        return True, str(result)
+    except Exception as e:
+        return False, str(e)[:160]
 
 
 def handle_turnstile(sb) -> bool:
-    """处理续期对话框内的 Cloudflare Turnstile。"""
+    """处理续期对话框内的 Cloudflare Turnstile。
+
+    处理优先级：
+      1. 已有 token 直接通过；
+      2. SeleniumBase uc_gui_click_captcha()（不依赖 iframe DOM 定位）；
+      3. 原有 CDP iframe 坐标点击作为兜底。
+    """
     print("🔍 处理 Cloudflare Turnstile 验证...")
     time.sleep(1.5)
 
     try:
         if sb.execute_script(_SOLVED_JS):
-            print("✅ Turnstile 已有有效 token")
+            print("  ✅ Turnstile 已有有效 token")
             return True
     except Exception:
         pass
@@ -325,16 +315,27 @@ def handle_turnstile(sb) -> bool:
         print(f"  🔄 Turnstile 第 {attempt}/{TURNSTILE_MAX_ATTEMPTS} 轮")
         try:
             killed = kill_ad_overlay(sb)
+
+            # ===== 第一优先级：SeleniumBase 原生 GUI CAPTCHA 点击 =====
+            # 不再要求 iframe 必须被 document.querySelectorAll('iframe') 找到。
+            # Cloudflare 动态 iframe / shadow DOM 情况下，这正是原方案失败的原因。
+            ok, detail = _uc_gui_turnstile(sb)
+            if ok:
+                if _wait_turnstile_token(sb, timeout=TURNSTILE_TOKEN_WAIT):
+                    return True
+                print("    ⚠️ GUI 点击已执行，但 token 尚未生成，继续使用 CDP 兜底")
+
+            # ===== 第二优先级：传统 DOM + CDP 坐标点击 =====
             info, err = ts_info(sb)
             if info is None:
                 print(f"  ⚠️ 读取 Turnstile 状态失败: {err}")
-                time.sleep(2)
+                time.sleep(1.5)
                 continue
 
             tok = info.get("token")
             rects = info.get("rects") or []
             if isinstance(tok, int) and tok > 20:
-                print(f"✅ Turnstile 已通过（token 长度 {tok}）")
+                print(f"  ✅ Turnstile 已通过（token 长度 {tok}）")
                 return True
 
             if not rects:
@@ -342,38 +343,45 @@ def handle_turnstile(sb) -> bool:
                     sb.execute_script(_EXPAND_JS)
                 except Exception:
                     pass
-                time.sleep(2)
+                time.sleep(1)
                 info, _ = ts_info(sb)
                 rects = (info or {}).get("rects") or []
 
             if not rects:
-                print(f"  ⚠️ 第 {attempt} 轮未找到 Turnstile iframe，等待重试")
+                print(
+                    f"  ⚠️ 第 {attempt} 轮仍未找到可定位的 Turnstile iframe；"
+                    "GUI 路径已尝试，等待 Cloudflare 重新渲染"
+                )
+                time.sleep(2)
                 continue
 
-            # 优先选择面积最大的 iframe。
-            rects = sorted(rects, key=lambda r: float(r[2]) * float(r[3]), reverse=True)
-            clicked = False
+            rects = sorted(
+                rects,
+                key=lambda r: float(r[2]) * float(r[3]),
+                reverse=True,
+            )
+
             for rect in rects[:2]:
                 try:
                     for cx, cy in _turnstile_click_points(rect):
                         res = ts_click_cdp(sb, cx, cy)
-                        print(f"  🖱️ 点击 checkbox ({cx:.0f},{cy:.0f}) → {res}")
-                        clicked = True
-                        if _wait_turnstile_token(sb):
+                        print(f"  🖱️ CDP 点击 checkbox ({cx:.0f},{cy:.0f}) → {res}")
+                        if _wait_turnstile_token(sb, timeout=TURNSTILE_TOKEN_WAIT):
                             return True
                 except Exception as e:
-                    print(f"  ⚠️ 点击异常: {e}")
+                    print(f"  ⚠️ CDP 点击异常: {e}")
 
-            if not clicked:
+            if not rects:
                 print(f"  ⚠️ 第 {attempt} 轮没有执行有效点击，清广告={killed}")
+
             time.sleep(1.5)
+
         except Exception as e:
             print(f"  ⚠️ Turnstile 第 {attempt} 轮异常: {e}")
             time.sleep(2)
 
     print(f"  ❌ Turnstile {TURNSTILE_MAX_ATTEMPTS} 轮均未取得有效 token")
     return False
-
 
 def page_text(sb) -> str:
     try:
@@ -906,7 +914,7 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     now_res = click_by_text(sb, "renew now", timeout=5)
     if str(now_res).startswith("clicked"):
         print(f"  ⚡ ad-free 帐号：对话框里直接 Renew Now（{now_res}）")
-        return read_renew_result(sb, sid)
+        return read_renew_result(sb, sid, days_before)
 
     # 2. 装 window.open 垫片 → 点 Read Article
     #    面板靠 window.open('about:blank') 开文章页；JS 合成 click 冇 user activation，
