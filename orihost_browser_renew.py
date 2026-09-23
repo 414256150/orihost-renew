@@ -24,7 +24,6 @@ CLAIM_TIMEOUT = int(os.environ.get("CLAIM_TIMEOUT") or "150")
 
 
 # ---------- 代理 ----------
-# 优先级：ORIHOST_PROXY 显式指定 > 工作流 sing-box（IS_PROXY/PROXY_SERVER，由 NODE_LINK 转出）
 def _get_proxy():
     explicit = (os.environ.get("ORIHOST_PROXY") or os.environ.get("ORIHOST_GOST_PROXY") or "").strip()
     if explicit:
@@ -72,7 +71,7 @@ def now_bj():
     return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ---------- 账号解析（与 orihost_renew.py 同一套变量名） ----------
+# ---------- 账号解析 ----------
 def _split_ids(raw: str):
     return [s.strip() for s in (raw or "").replace(";", ",").split(",") if s.strip()]
 
@@ -121,7 +120,7 @@ def load_accounts():
     return accounts
 
 
-# ---------- Turnstile 处理（移植自 katabump，经实测有效） ----------
+# ---------- Turnstile 处理 ----------
 _EXPAND_JS = """
 (function() {
     var ts = document.querySelector('input[name="cf-turnstile-response"]');
@@ -205,29 +204,39 @@ def handle_turnstile(sb) -> bool:
     return False
 
 
-# ---------- 页面工具（文本匹配按钮，面板是 React，文本最稳） ----------
+# ---------- 页面工具 ----------
 def find_button_by_text(sb, *keywords, timeout=10):
-    """在 button 和 a 里找文本包含关键词的第一个可见元素（更宽容）"""
+    """用纯 JS 找包含关键词的按钮（更稳）"""
     end = time.time() + timeout
     kws = [k.lower() for k in keywords]
     while time.time() < end:
         try:
-            for el in sb.find_elements("button") + sb.find_elements("a"):
+            result = sb.execute_script("""
+                const kws = arguments[0];
+                const buttons = Array.from(document.querySelectorAll('button, a'));
+                for (const b of buttons) {
+                    const t = (b.innerText || b.textContent || '').toLowerCase().trim();
+                    if (!t) continue;
+                    if (kws.some(k => t.includes(k))) {
+                        // 返回一个可被 Selenium 识别的元素
+                        b.setAttribute('data-renew-found', '1');
+                        return true;
+                    }
+                }
+                return false;
+            """, kws)
+            if result:
+                # 再通过属性拿到元素
                 try:
-                    if not el.is_displayed():
-                        continue
-                    txt = (el.text or "").strip().lower()
-                    if not txt:
-                        try:
-                            txt = (sb.execute_script(
-                                "return arguments[0].innerText || arguments[0].textContent || '';", el
-                            ) or "").strip().lower()
-                        except Exception:
-                            pass
-                    if txt and any(k in txt for k in kws):
-                        return el
+                    el = sb.find_element("css selector", "[data-renew-found='1']")
+                    return el
                 except Exception:
-                    continue
+                    # 直接用 JS 点击
+                    sb.execute_script("""
+                        const el = document.querySelector("[data-renew-found='1']");
+                        if (el) { el.click(); }
+                    """)
+                    return "js_clicked"
         except Exception:
             pass
         time.sleep(1)
@@ -269,7 +278,6 @@ def cookie_login(sb, auth_raw: str) -> bool:
 def renew_one_server(sb, server_uuid: str) -> dict:
     sid = (server_uuid or "").split("-")[0][:8]
     print(f"\n  🖥 [{sid}] 打开服务器页...")
-    # 面板路由用的是 8 位短 ID（如 /server/8651e616），填了完整 UUID 也只取前 8 位
     sb.open(f"{PANEL}/server/{sid}")
     time.sleep(8)
     src = page_text(sb)
@@ -278,92 +286,87 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     if "expired renewal" in src or "suspended due" in src:
         print("  ⚠️ 服务器因过期被暂停，走续期流程恢复")
 
-    # 1. 点 Renew（增强版查找）
-    print("  🔍 找 Renew 按钮...")
+    # ========== 1. 纯 JS 找并点击 Renew ==========
+    print("  🔍 找 Renew 按钮（纯 JS）...")
     print(f"  📍 当前 URL: {sb.get_current_url()}")
     try:
         print(f"  📄 页面标题: {sb.get_title()}")
     except Exception:
         pass
 
-    time.sleep(5)  # 再等 React 渲染稳定
+    time.sleep(6)  # 多等 React 渲染
 
-    # 调试：打印所有可见按钮
-    print("  🔎 页面上所有可见按钮：")
-    try:
-        btns = sb.find_elements("button")
-        print(f"  共找到 {len(btns)} 个 button")
-        for i, el in enumerate(btns):
-            try:
-                txt = (el.text or "").strip().replace("\n", " ")
-                visible = el.is_displayed()
-                enabled = el.is_enabled()
-                cls = (el.get_attribute("class") or "")[:70]
-                print(f"    [{i}] visible={visible} enabled={enabled} text='{txt}' class='{cls}'")
-            except Exception as e:
-                print(f"    [{i}] 读取失败: {e}")
-    except Exception as e:
-        print(f"  打印按钮失败: {e}")
+    js_result = sb.execute_script("""
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const info = buttons.map((b, i) => {
+            const text = (b.innerText || b.textContent || '').trim().replace(/\\n/g, ' ');
+            const cls = (b.className || '').toString().slice(0, 90);
+            const disabled = b.disabled || b.getAttribute('disabled') !== null ||
+                            (b.className || '').toLowerCase().includes('disabled');
+            const hasCalendar = !!b.querySelector('svg[data-icon="calendar-plus"]');
+            return {
+                index: i,
+                text: text,
+                class: cls,
+                disabled: disabled,
+                hasCalendar: hasCalendar,
+                visible: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length)
+            };
+        });
 
-    renew_btn = None
-
-    # 方式1：JS 暴力查找（最稳）
-    try:
-        renew_btn = sb.execute_script("""
-            const buttons = Array.from(document.querySelectorAll('button'));
-            // 优先找带 calendar-plus 图标的
-            let btn = buttons.find(b => {
-                const svg = b.querySelector('svg[data-icon="calendar-plus"]');
+        // 优先找带 calendar-plus 且文字含 renew 的
+        let target = buttons.find(b => {
+            const t = (b.innerText || b.textContent || '').toLowerCase();
+            return b.querySelector('svg[data-icon="calendar-plus"]') && t.includes('renew');
+        });
+        // 其次任意含 renew 的
+        if (!target) {
+            target = buttons.find(b => {
                 const t = (b.innerText || b.textContent || '').toLowerCase();
-                return svg && t.includes('renew');
+                return t.includes('renew');
             });
-            if (!btn) {
-                btn = buttons.find(b => {
-                    const t = (b.innerText || b.textContent || '').toLowerCase();
-                    return t.includes('renew');
-                });
+        }
+        // 再其次只有 calendar-plus 图标的
+        if (!target) {
+            target = buttons.find(b => b.querySelector('svg[data-icon="calendar-plus"]'));
+        }
+
+        let clicked = false;
+        let disabled = false;
+        if (target) {
+            const isDisabled = target.disabled ||
+                               target.getAttribute('disabled') !== null ||
+                               (target.className || '').toLowerCase().includes('disabled');
+            if (isDisabled) {
+                disabled = true;
+            } else {
+                target.scrollIntoView({block: 'center', behavior: 'instant'});
+                target.click();
+                clicked = true;
             }
-            return btn || null;
-        """)
-        if renew_btn:
-            print("  ✅ JS 找到 Renew 按钮")
-    except Exception as e:
-        print(f"  JS 查找异常: {e}")
+        }
 
-    # 方式2：多种 XPath
-    if renew_btn is None:
-        xpaths = [
-            "//button[.//svg[@data-icon='calendar-plus'] and contains(., 'Renew')]",
-            "//button[.//svg[@data-icon='calendar-plus']]",
-            "//button[contains(., 'Renew')]",
-            "//button[contains(translate(., 'RENEW', 'renew'), 'renew')]",
-            "//*[contains(text(),'Renew')]/ancestor::button[1]",
-            "//button[contains(@class,'Button__StyledButton') and contains(., 'Renew')]",
-            "//button[contains(@class,'cbTYkk')]",
-        ]
-        for xpath in xpaths:
-            try:
-                els = sb.find_elements("xpath", xpath)
-                for el in els:
-                    try:
-                        if el.is_displayed():
-                            renew_btn = el
-                            print(f"  ✅ XPath 找到: {xpath}")
-                            break
-                    except Exception:
-                        continue
-                if renew_btn:
-                    break
-            except Exception:
-                pass
+        return {
+            total: buttons.length,
+            buttons: info,
+            found: !!target,
+            clicked: clicked,
+            disabled: disabled
+        };
+    """)
 
-    # 方式3：原来的文字匹配兜底
-    if renew_btn is None:
-        renew_btn = find_button_by_text(sb, "renew", timeout=12)
-        if renew_btn:
-            print("  ✅ 文字匹配找到 Renew 按钮")
+    print(f"  JS 结果: total={js_result.get('total')} found={js_result.get('found')} "
+          f"clicked={js_result.get('clicked')} disabled={js_result.get('disabled')}")
 
-    if renew_btn is None:
+    for b in (js_result.get("buttons") or []):
+        print(f"    [{b.get('index')}] visible={b.get('visible')} disabled={b.get('disabled')} "
+              f"hasCalendar={b.get('hasCalendar')} text='{b.get('text')}' class='{b.get('class')}'")
+
+    if js_result.get("disabled"):
+        sb.save_screenshot(f"renew_disabled_{sid}.png")
+        return {"status": "⏭️ 跳过", "message": "Renew 按钮存在但被禁用（可能积分不足或已达上限）"}
+
+    if not js_result.get("found") or not js_result.get("clicked"):
         sb.save_screenshot(f"no_renew_btn_{sid}.png")
         try:
             with open(f"page_source_{sid}.html", "w", encoding="utf-8") as f:
@@ -373,37 +376,32 @@ def renew_one_server(sb, server_uuid: str) -> dict:
             pass
         return {"status": "❌ 续期失败", "message": "没找到 Renew 按钮（页面结构可能变了）"}
 
-    # 检查是否被禁用
-    try:
-        cls = (renew_btn.get_attribute("class") or "").lower()
-        if "disabled" in cls or not renew_btn.is_enabled():
-            sb.save_screenshot(f"renew_disabled_{sid}.png")
-            return {"status": "⏭️ 跳过", "message": "Renew 按钮存在但被禁用（可能积分不足或已达上限）"}
-    except Exception:
-        pass
-
-    print("  🖱️ 点击 Renew 按钮...")
-    try:
-        renew_btn.click()
-    except Exception:
-        sb.execute_script("arguments[0].click();", renew_btn)
+    print("  ✅ 已通过 JS 点击 Renew 按钮")
     time.sleep(4)
 
-    # 2. 点 Read Article（会弹新标签）
+    # ========== 2. 点 Read Article ==========
     print("  🖱️ 点 Read Article...")
-    read_btn = find_button_by_text(sb, "read article", timeout=15)
-    if read_btn is None:
-        # 可能已经在 reading 状态（倒计时中），直接往下走
+    read_clicked = sb.execute_script("""
+        const buttons = Array.from(document.querySelectorAll('button, a'));
+        const target = buttons.find(b => {
+            const t = (b.innerText || b.textContent || '').toLowerCase();
+            return t.includes('read article');
+        });
+        if (target) {
+            target.scrollIntoView({block: 'center', behavior: 'instant'});
+            target.click();
+            return true;
+        }
+        return false;
+    """)
+
+    if not read_clicked:
         print("  ℹ️ 没找到 Read Article，可能已在倒计时，直接等待")
     else:
         before = set(sb.driver.window_handles)
-        try:
-            read_btn.click()
-        except Exception:
-            sb.execute_script("arguments[0].click();", read_btn)
         # 等新标签出现
         article_handle = None
-        for _ in range(10):
+        for _ in range(12):
             time.sleep(1)
             after = set(sb.driver.window_handles)
             new = after - before
@@ -419,14 +417,27 @@ def renew_one_server(sb, server_uuid: str) -> dict:
         sb.driver.switch_to.window(list(before)[0])
         time.sleep(4)
 
-    # 3. 等倒计时走完（Claim 按钮出现）
+    # ========== 3. 等倒计时，找 Claim Renewal ==========
     print("  ⏳ 等倒计时走完，找 Claim Renewal...")
-    claim_btn = find_button_by_text(sb, "claim renewal", timeout=120)
-    if claim_btn is None:
+    claim_found = False
+    for _ in range(60):  # 最多等约 120 秒
+        claim_found = sb.execute_script("""
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const target = buttons.find(b => {
+                const t = (b.innerText || b.textContent || '').toLowerCase();
+                return t.includes('claim renewal');
+            });
+            return !!target;
+        """)
+        if claim_found:
+            break
+        time.sleep(2)
+
+    if not claim_found:
         sb.save_screenshot(f"no_claim_btn_{sid}.png")
         return {"status": "❌ 续期失败", "message": "120s 没等到 Claim Renewal（倒计时异常）"}
 
-    # 4. 过 Turnstile（有才点，没有就跳过）
+    # ========== 4. 过 Turnstile ==========
     try:
         has_ts = sb.execute_script(_HAS_TURNSTILE_JS)
     except Exception:
@@ -438,27 +449,33 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     else:
         print("  ℹ️ 未检测到验证组件")
 
-    # 5. 点 Claim Renewal（等它从 disabled 变可点）
+    # ========== 5. 点 Claim Renewal ==========
     print("  🖱️ 点 Claim Renewal...")
     claimed = False
     for _ in range(60):
-        try:
-            btns = [el for el in sb.find_elements("button") if el.is_displayed() and "claim renewal" in (el.text or "").lower()]
-            if btns and btns[0].is_enabled():
-                try:
-                    btns[0].click()
-                except Exception:
-                    sb.execute_script("arguments[0].click();", btns[0])
-                claimed = True
-                break
-        except Exception:
-            pass
+        claimed = sb.execute_script("""
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const target = buttons.find(b => {
+                const t = (b.innerText || b.textContent || '').toLowerCase();
+                return t.includes('claim renewal') && !b.disabled &&
+                       !(b.className || '').toLowerCase().includes('disabled');
+            });
+            if (target) {
+                target.scrollIntoView({block: 'center', behavior: 'instant'});
+                target.click();
+                return true;
+            }
+            return false;
+        """)
+        if claimed:
+            break
         time.sleep(2)
+
     if not claimed:
         return {"status": "❌ 续期失败", "message": "Claim 按钮一直不可点（倒计时/验证没完成）"}
     time.sleep(8)
 
-    # 6. 读结果
+    # ========== 6. 读结果 ==========
     src = page_text(sb)
     if "renew limit reached" in src:
         return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
