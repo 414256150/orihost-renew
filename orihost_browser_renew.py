@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Orihost 浏览器自动续期（SeleniumBase + 真浏览器）
+# v2 Turnstile/Claim 强化版：保留 remember_web Cookie 登录与轮换
 # 背景：面板 claim 接口强制要求 Cloudflare Turnstile token（GET /api/client/renewal/complete?cf-turnstile-response=xxx），
 #       纯 HTTP 调不通（无 token 直接 500），必须用真浏览器点验证。
 # 流程：Cookie 免登 → 服务器页 → Renew（打开对话框）→ Read Article（新标签读文章）→ 倒计时 → 点 Turnstile → Claim Renewal
@@ -24,6 +25,13 @@ DEFAULT_REMEMBER_NAME = "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d"
 ARTICLE_WAIT = int(os.environ.get("ARTICLE_WAIT") or "30")
 # Claim 按钮轮询上限
 CLAIM_TIMEOUT = int(os.environ.get("CLAIM_TIMEOUT") or "150")
+
+# ===== Turnstile / Claim 参数 =====
+# 强化原因：先完成 Turnstile，再等待 Claim 解锁，避免“先点 Claim 失败→才处理验证码”的竞态。
+TURNSTILE_MAX_ATTEMPTS = max(1, int(os.environ.get("TURNSTILE_MAX_ATTEMPTS") or "8"))
+TURNSTILE_TOKEN_WAIT = max(3, int(os.environ.get("TURNSTILE_TOKEN_WAIT") or "12"))
+TURNSTILE_POLL_INTERVAL = max(0.5, float(os.environ.get("TURNSTILE_POLL_INTERVAL") or "1"))
+CLAIM_ENABLE_WAIT = max(5, int(os.environ.get("CLAIM_ENABLE_WAIT") or "25"))
 
 # ---------- 代理 ----------
 # 优先级：ORIHOST_PROXY 显式指定 > 工作流 sing-box（IS_PROXY/PROXY_SERVER，由 NODE_LINK 转出）
@@ -266,56 +274,104 @@ def ts_click_cdp(sb, x, y):
         return "cdp-err:" + str(e)[:60]
 
 
-def handle_turnstile(sb) -> bool:
-    """处理续期对话框内嘅 Cloudflare Turnstile。
+def _wait_turnstile_token(sb, timeout=TURNSTILE_TOKEN_WAIT):
+    """等待 Turnstile token 真正写入 DOM。"""
+    deadline = time.time() + timeout
+    last_len = 0
+    while time.time() < deadline:
+        try:
+            info, _ = ts_info(sb)
+            if info:
+                token = info.get("token")
+                if isinstance(token, int):
+                    last_len = token
+                    if token > 20:
+                        print(f"  ✅ Turnstile token 已生成，长度 {token}")
+                        return True
+        except Exception:
+            pass
+        time.sleep(TURNSTILE_POLL_INTERVAL)
+    print(f"  ⚠️ Turnstile 等待超时，最后 token 长度 {last_len}")
+    return False
 
-    经验（run 35452946138）：uc_gui_click_captcha 点极都过唔到，因为
-    ① 面板免费方案会弹广告遮罩（Download is ready）盖住组件
-    ② pyautogui 嘅盲点坐标撞正遮罩
-    所以改成：先清广告 → 读组件 iframe 真实坐标 → 用 CDP 派发真鼠标事件点 checkbox。
-    """
+
+def _turnstile_click_points(rect):
+    """根据 iframe 位置生成几个安全的 checkbox 点击点。"""
+    x, y, w, h = [float(v) for v in rect[:4]]
+    cy = y + max(h / 2, 16)
+    points = [(x + 24, cy), (x + 30, y + max(h / 2, 20))]
+    result, seen = [], set()
+    for px, py in points:
+        key = (round(px, 1), round(py, 1))
+        if px > 0 and py > 0 and key not in seen:
+            seen.add(key)
+            result.append((px, py))
+    return result
+
+
+def handle_turnstile(sb) -> bool:
+    """处理续期对话框内的 Cloudflare Turnstile。"""
     print("🔍 处理 Cloudflare Turnstile 验证...")
-    time.sleep(2)
+    time.sleep(1.5)
+
     try:
         if sb.execute_script(_SOLVED_JS):
-            print("✅ 已静默通过")
+            print("✅ Turnstile 已有有效 token")
             return True
     except Exception:
         pass
-    for attempt in range(8):
-        killed = kill_ad_overlay(sb)
-        info, err = ts_info(sb)
-        if info is None:
-            print(f"  ⚠️ 读 Turnstile 状态失败: {err}")
-            time.sleep(2)
-            continue
-        tok, rects = info.get("token"), info.get("rects") or []
-        if isinstance(tok, int) and tok > 20:
-            print(f"✅ Turnstile 通过（第 {attempt + 1} 轮，token 长度 {tok}）")
-            return True
-        if attempt == 0:
-            print(f"  组件: token_len={tok} iframe={rects} 清广告={killed}")
-        if not rects:
-            print(f"  ⚠️ 第 {attempt + 1} 轮：未见到 Turnstile iframe，等一等再试")
-            time.sleep(3)
-            continue
+
+    for attempt in range(1, TURNSTILE_MAX_ATTEMPTS + 1):
+        print(f"  🔄 Turnstile 第 {attempt}/{TURNSTILE_MAX_ATTEMPTS} 轮")
         try:
-            sb.execute_script(_EXPAND_JS)
-        except Exception:
-            pass
-        x, y, w, h = rects[0]
-        # checkbox 喺组件左侧约 24px 处、垂直居中
-        cx, cy = x + 24, y + max(h // 2, 16)
-        res = ts_click_cdp(sb, cx, cy)
-        print(f"  ️ 第 {attempt + 1} 轮点 checkbox ({cx},{cy}) → {res}")
-        for _ in range(10):
-            time.sleep(1)
-            info, _ = ts_info(sb)
-            if info and isinstance(info.get("token"), int) and info["token"] > 20:
-                print(f"✅ Turnstile 通过（第 {attempt + 1} 轮，token 长度 {info['token']}）")
+            killed = kill_ad_overlay(sb)
+            info, err = ts_info(sb)
+            if info is None:
+                print(f"  ⚠️ 读取 Turnstile 状态失败: {err}")
+                time.sleep(2)
+                continue
+
+            tok = info.get("token")
+            rects = info.get("rects") or []
+            if isinstance(tok, int) and tok > 20:
+                print(f"✅ Turnstile 已通过（token 长度 {tok}）")
                 return True
-        print(f"  ⚠️ 第 {attempt + 1} 轮未通过，重试...")
-    print("  ❌ Turnstile 8 轮均失败")
+
+            if not rects:
+                try:
+                    sb.execute_script(_EXPAND_JS)
+                except Exception:
+                    pass
+                time.sleep(2)
+                info, _ = ts_info(sb)
+                rects = (info or {}).get("rects") or []
+
+            if not rects:
+                print(f"  ⚠️ 第 {attempt} 轮未找到 Turnstile iframe，等待重试")
+                continue
+
+            # 优先选择面积最大的 iframe。
+            rects = sorted(rects, key=lambda r: float(r[2]) * float(r[3]), reverse=True)
+            clicked = False
+            for rect in rects[:2]:
+                try:
+                    for cx, cy in _turnstile_click_points(rect):
+                        res = ts_click_cdp(sb, cx, cy)
+                        print(f"  🖱️ 点击 checkbox ({cx:.0f},{cy:.0f}) → {res}")
+                        clicked = True
+                        if _wait_turnstile_token(sb):
+                            return True
+                except Exception as e:
+                    print(f"  ⚠️ 点击异常: {e}")
+
+            if not clicked:
+                print(f"  ⚠️ 第 {attempt} 轮没有执行有效点击，清广告={killed}")
+            time.sleep(1.5)
+        except Exception as e:
+            print(f"  ⚠️ Turnstile 第 {attempt} 轮异常: {e}")
+            time.sleep(2)
+
+    print(f"  ❌ Turnstile {TURNSTILE_MAX_ATTEMPTS} 轮均未取得有效 token")
     return False
 
 
@@ -696,7 +752,7 @@ def read_renew_result(sb, sid, days_before=None) -> dict:
     面板成功后会 window.location.reload()，所以先用 API 对比续期天数最稳，
     页面文字只做辅助（唔再靠 'renewed' 之类模糊关键字）。
     """
-    time.sleep(8)
+    time.sleep(int(os.environ.get("CLAIM_RESULT_WAIT") or "30"))
     src = page_text(sb)
     if "renew limit reached" in src:
         return {"status": "\u23ed\ufe0f 跳过", "message": "已达续期上限（Renew Limit Reached）"}
@@ -911,39 +967,68 @@ def renew_one_server(sb, server_uuid: str) -> dict:
         sb.save_screenshot(f"stuck_confirm_{sid}.png")
         return {"status": "\u274c 续期失败", "message": "对话框卡在 confirm（Read Article 未生效/弹窗被拦）"}
 
-    # 3. 过 Turnstile（如果有）→ 点 Claim Renewal
-    print("  ⏳ 找 Claim Renewal...")
+    # 3. 先完成 Turnstile，再点 Claim Renewal
+    print("  ⏳ 检查 Turnstile / Claim Renewal...")
     ts_state = None
     clicked = False
     n_try = 0
     deadline = time.time() + CLAIM_TIMEOUT
+
     while time.time() < deadline:
-        res = click_by_text(sb, "claim renewal", timeout=6)
-        sres = str(res)
-        if sres.startswith("clicked"):
-            print(f"  \U0001f5b1\ufe0f 点 Claim Renewal: {sres}")
-            clicked = True
-            break
-        if ts_state is None:
+        # 第一步：如果页面有 Turnstile，必须先拿到 token。
+        try:
+            has_ts = bool(sb.execute_script(_HAS_TURNSTILE_JS))
+        except Exception:
+            has_ts = False
+
+        if has_ts and ts_state is not True:
+            print("  🔐 检测到 Turnstile，先完成验证")
+            ts_state = handle_turnstile(sb)
+            if ts_state is False:
+                sb.save_screenshot(f"turnstile_fail_{sid}.png")
+                return {"status": "❌ 续期失败", "message": f"Turnstile 验证 {TURNSTILE_MAX_ATTEMPTS} 次未通过"}
+            time.sleep(1)
+
+        # 第二步：等待 Claim 按钮解除 disabled，再点击。
+        enable_deadline = min(deadline, time.time() + CLAIM_ENABLE_WAIT)
+        while time.time() < enable_deadline:
+            res = click_by_text(sb, "claim renewal", timeout=6)
+            sres = str(res)
+            if sres.startswith("clicked"):
+                print(f"  🖱️ 点 Claim Renewal: {sres}")
+                clicked = True
+                break
+
+            if res and res.get("disabled"):
+                print("    Claim Renewal 仍 disabled，继续等待 token/页面状态同步")
+            else:
+                n_try += 1
+                if n_try <= 4 or n_try % 6 == 0:
+                    print(f"    （第 {n_try} 次：state={detect_state(sb)!r} 倒计时={dialog_countdown(sb)} claim={sres[:50]}）")
+
+            # 如果 Cloudflare 重新渲染，重新处理。
             try:
-                has_ts = sb.execute_script(_HAS_TURNSTILE_JS)
+                current_has_ts = bool(sb.execute_script(_HAS_TURNSTILE_JS))
             except Exception:
-                has_ts = False
-            if has_ts:
+                current_has_ts = False
+            if current_has_ts and ts_state is not True:
                 ts_state = handle_turnstile(sb)
                 if ts_state is False:
                     sb.save_screenshot(f"turnstile_fail_{sid}.png")
-                    return {"status": "\u274c 续期失败", "message": "Turnstile 验证 6 次未通过"}
-            else:
-                pass  # 统一由下面嘅状态行打印
-        if not clicked and ts_state is None:
-            n_try += 1
-            if n_try <= 4 or n_try % 6 == 0:
-                print(f"    （第 {n_try} 次：state={detect_state(sb)!r} 倒计时={dialog_countdown(sb)} claim={sres[:40]}）")
-        time.sleep(3)
+                    return {"status": "❌ 续期失败", "message": f"Turnstile 验证 {TURNSTILE_MAX_ATTEMPTS} 次未通过"}
+
+            time.sleep(TURNSTILE_POLL_INTERVAL)
+
+        if clicked:
+            break
+
+        # 没点到且总超时未到，再循环检查页面。
+        ts_state = None
+        time.sleep(1)
+
     if not clicked:
         sb.save_screenshot(f"no_claim_btn_{sid}.png")
-        return {"status": "\u274c 续期失败", "message": "等唔到可点嘅 Claim Renewal（倒计时/验证未完成）"}
+        return {"status": "❌ 续期失败", "message": "等唔到可点嘅 Claim Renewal（倒计时/验证未完成）"}
 
     # 6. 读结果
     return read_renew_result(sb, sid, days_before)
