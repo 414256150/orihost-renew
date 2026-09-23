@@ -5,7 +5,6 @@
 #       纯 HTTP 调不通（无 token 直接 500），必须用真浏览器点验证。
 # 流程：Cookie 免登 → 服务器页 → Renew Now → Read Article（新标签读文章）→ 倒计时 → 点 Turnstile → Claim Renewal
 # 参考：katabump-renew-main（同款 Turnstile 处理 + xvfb 无头方案）
-
 import os
 import sys
 import time
@@ -23,6 +22,7 @@ ARTICLE_WAIT = int(os.environ.get("ARTICLE_WAIT") or "30")
 # Claim 按钮轮询上限
 CLAIM_TIMEOUT = int(os.environ.get("CLAIM_TIMEOUT") or "150")
 
+
 # ---------- 代理 ----------
 # 优先级：ORIHOST_PROXY 显式指定 > 工作流 sing-box（IS_PROXY/PROXY_SERVER，由 NODE_LINK 转出）
 def _get_proxy():
@@ -38,8 +38,10 @@ def _get_proxy():
         return srv
     return ""
 
+
 PROXY_STR = _get_proxy()
 IS_PROXY = bool(PROXY_STR)
+
 
 # ---------- Telegram ----------
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
@@ -205,7 +207,7 @@ def handle_turnstile(sb) -> bool:
 
 # ---------- 页面工具（文本匹配按钮，面板是 React，文本最稳） ----------
 def find_button_by_text(sb, *keywords, timeout=10):
-    """在 button 和 a 里找文本包含关键词的第一个可见元素"""
+    """在 button 和 a 里找文本包含关键词的第一个可见元素（更宽容）"""
     end = time.time() + timeout
     kws = [k.lower() for k in keywords]
     while time.time() < end:
@@ -215,6 +217,13 @@ def find_button_by_text(sb, *keywords, timeout=10):
                     if not el.is_displayed():
                         continue
                     txt = (el.text or "").strip().lower()
+                    if not txt:
+                        try:
+                            txt = (sb.execute_script(
+                                "return arguments[0].innerText || arguments[0].textContent || '';", el
+                            ) or "").strip().lower()
+                        except Exception:
+                            pass
                     if txt and any(k in txt for k in kws):
                         return el
                 except Exception:
@@ -269,38 +278,102 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     if "expired renewal" in src or "suspended due" in src:
         print("  ⚠️ 服务器因过期被暂停，走续期流程恢复")
 
-    # 1. 点 Renew（优先用更稳的选择器）
+    # 1. 点 Renew（增强版查找）
     print("  🔍 找 Renew 按钮...")
+    print(f"  📍 当前 URL: {sb.get_current_url()}")
+    try:
+        print(f"  📄 页面标题: {sb.get_title()}")
+    except Exception:
+        pass
+
+    time.sleep(5)  # 再等 React 渲染稳定
+
+    # 调试：打印所有可见按钮
+    print("  🔎 页面上所有可见按钮：")
+    try:
+        btns = sb.find_elements("button")
+        print(f"  共找到 {len(btns)} 个 button")
+        for i, el in enumerate(btns):
+            try:
+                txt = (el.text or "").strip().replace("\n", " ")
+                visible = el.is_displayed()
+                enabled = el.is_enabled()
+                cls = (el.get_attribute("class") or "")[:70]
+                print(f"    [{i}] visible={visible} enabled={enabled} text='{txt}' class='{cls}'")
+            except Exception as e:
+                print(f"    [{i}] 读取失败: {e}")
+    except Exception as e:
+        print(f"  打印按钮失败: {e}")
+
     renew_btn = None
 
-    for xpath in [
-        "//button[.//svg[@data-icon='calendar-plus'] and contains(., 'Renew')]",
-        "//button[contains(., 'Renew')]",
-        "//button[.//svg[@data-icon='calendar-plus']]",
-    ]:
-        try:
-            els = sb.find_elements("xpath", xpath)
-            for el in els:
-                try:
-                    if el.is_displayed():
-                        renew_btn = el
-                        break
-                except Exception:
-                    continue
-            if renew_btn:
-                break
-        except Exception:
-            pass
+    # 方式1：JS 暴力查找（最稳）
+    try:
+        renew_btn = sb.execute_script("""
+            const buttons = Array.from(document.querySelectorAll('button'));
+            // 优先找带 calendar-plus 图标的
+            let btn = buttons.find(b => {
+                const svg = b.querySelector('svg[data-icon="calendar-plus"]');
+                const t = (b.innerText || b.textContent || '').toLowerCase();
+                return svg && t.includes('renew');
+            });
+            if (!btn) {
+                btn = buttons.find(b => {
+                    const t = (b.innerText || b.textContent || '').toLowerCase();
+                    return t.includes('renew');
+                });
+            }
+            return btn || null;
+        """)
+        if renew_btn:
+            print("  ✅ JS 找到 Renew 按钮")
+    except Exception as e:
+        print(f"  JS 查找异常: {e}")
 
-    # 兜底：原来的文字匹配
+    # 方式2：多种 XPath
     if renew_btn is None:
-        renew_btn = find_button_by_text(sb, "renew", timeout=15)
+        xpaths = [
+            "//button[.//svg[@data-icon='calendar-plus'] and contains(., 'Renew')]",
+            "//button[.//svg[@data-icon='calendar-plus']]",
+            "//button[contains(., 'Renew')]",
+            "//button[contains(translate(., 'RENEW', 'renew'), 'renew')]",
+            "//*[contains(text(),'Renew')]/ancestor::button[1]",
+            "//button[contains(@class,'Button__StyledButton') and contains(., 'Renew')]",
+            "//button[contains(@class,'cbTYkk')]",
+        ]
+        for xpath in xpaths:
+            try:
+                els = sb.find_elements("xpath", xpath)
+                for el in els:
+                    try:
+                        if el.is_displayed():
+                            renew_btn = el
+                            print(f"  ✅ XPath 找到: {xpath}")
+                            break
+                    except Exception:
+                        continue
+                if renew_btn:
+                    break
+            except Exception:
+                pass
+
+    # 方式3：原来的文字匹配兜底
+    if renew_btn is None:
+        renew_btn = find_button_by_text(sb, "renew", timeout=12)
+        if renew_btn:
+            print("  ✅ 文字匹配找到 Renew 按钮")
 
     if renew_btn is None:
         sb.save_screenshot(f"no_renew_btn_{sid}.png")
+        try:
+            with open(f"page_source_{sid}.html", "w", encoding="utf-8") as f:
+                f.write(sb.get_page_source() or "")
+            print(f"  已保存 page_source_{sid}.html 和 no_renew_btn_{sid}.png")
+        except Exception:
+            pass
         return {"status": "❌ 续期失败", "message": "没找到 Renew 按钮（页面结构可能变了）"}
 
-    # 检查是否被禁用（积分不够 / 已达上限时会灰掉）
+    # 检查是否被禁用
     try:
         cls = (renew_btn.get_attribute("class") or "").lower()
         if "disabled" in cls or not renew_btn.is_enabled():
@@ -309,6 +382,7 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     except Exception:
         pass
 
+    print("  🖱️ 点击 Renew 按钮...")
     try:
         renew_btn.click()
     except Exception:
@@ -410,15 +484,16 @@ def main():
     if not accounts:
         print("❌ 未配置账号。请设置 ORIHOST_REMEMBER + ORIHOST_SERVER_IDS ...")
         sys.exit(1)
-
-    sb_kwargs = {"uc": True, "headless": False,
-                 "chromium_arg": "--disable-popup-blocking,--disable-notifications"}
+    sb_kwargs = {
+        "uc": True,
+        "headless": False,
+        "chromium_arg": "--disable-popup-blocking,--disable-notifications",
+    }
     if IS_PROXY:
         print(f"🔗 挂载代理: {PROXY_STR}")
         sb_kwargs["proxy"] = PROXY_STR
     else:
         print("🌐 未使用代理，直连访问")
-
     results = []
     print("🚀 启动浏览器...")
     with SB(**sb_kwargs) as sb:
@@ -446,7 +521,6 @@ def main():
                 print(f"  {info['status']} {info['message']}")
                 send_tg(fmt_msg(info["status"], label, sv, info["message"]))
                 time.sleep(random.randint(2, 5))
-
     ok = sum(1 for r in results if "成功" in r["status"])
     skip = sum(1 for r in results if "跳过" in r["status"])
     fail = len(results) - ok - skip
