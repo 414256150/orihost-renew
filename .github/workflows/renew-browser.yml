@@ -5,8 +5,8 @@ name: Orihost Browser Renew
 # Cookie 免登 → Renew Now → Read Article（新标签读文章）→ 倒计时 → Turnstile → Claim Renewal
 on:
   schedule:
-    # 每 3 天一次，UTC 10:00 = 北京时间 18:00（7 天有效期，提前续避免删机）
-    - cron: '0 10 */3 * *'
+    # 每 3 天一次，UTC 10:00 = 北京时间 6:00（7 天有效期，提前续避免删机）
+    - cron: '0 22 */3 * *'
   workflow_dispatch:
 
 jobs:
