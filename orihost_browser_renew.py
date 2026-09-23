@@ -270,12 +270,12 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     if "expired renewal" in src or "suspended due" in src:
         print("  ⚠️ 服务器因过期被暂停，走续期流程恢复")
 
-    # 1. 点 Renew Now
-    print("  🔍 找 Renew Now 按钮...")
-    renew_btn = find_button_by_text(sb, "renew now", timeout=20)
+    # 1. 点 Renew
+    print("  🔍 找 Renew 按钮...")
+    renew_btn = find_button_by_text(sb, "renew", timeout=20)
     if renew_btn is None:
         sb.save_screenshot(f"no_renew_btn_{sid}.png")
-        return {"status": "❌ 续期失败", "message": "没找到 Renew Now 按钮（页面结构可能变了）"}
+        return {"status": "❌ 续期失败", "message": "没找到 Renew 按钮（页面结构可能变了）"}
     try:
         renew_btn.click()
     except Exception:
