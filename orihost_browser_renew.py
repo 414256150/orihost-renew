@@ -263,19 +263,52 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     # 面板路由用的是 8 位短 ID（如 /server/8651e616），填了完整 UUID 也只取前 8 位
     sb.open(f"{PANEL}/server/{sid}")
     time.sleep(8)
-
     src = page_text(sb)
     if "renew limit reached" in src:
         return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
     if "expired renewal" in src or "suspended due" in src:
         print("  ⚠️ 服务器因过期被暂停，走续期流程恢复")
 
-    # 1. 点 Renew
+    # 1. 点 Renew（优先用更稳的选择器）
     print("  🔍 找 Renew 按钮...")
-    renew_btn = find_button_by_text(sb, "renew", timeout=20)
+    renew_btn = None
+
+    for xpath in [
+        "//button[.//svg[@data-icon='calendar-plus'] and contains(., 'Renew')]",
+        "//button[contains(., 'Renew')]",
+        "//button[.//svg[@data-icon='calendar-plus']]",
+    ]:
+        try:
+            els = sb.find_elements("xpath", xpath)
+            for el in els:
+                try:
+                    if el.is_displayed():
+                        renew_btn = el
+                        break
+                except Exception:
+                    continue
+            if renew_btn:
+                break
+        except Exception:
+            pass
+
+    # 兜底：原来的文字匹配
+    if renew_btn is None:
+        renew_btn = find_button_by_text(sb, "renew", timeout=15)
+
     if renew_btn is None:
         sb.save_screenshot(f"no_renew_btn_{sid}.png")
         return {"status": "❌ 续期失败", "message": "没找到 Renew 按钮（页面结构可能变了）"}
+
+    # 检查是否被禁用（积分不够 / 已达上限时会灰掉）
+    try:
+        cls = (renew_btn.get_attribute("class") or "").lower()
+        if "disabled" in cls or not renew_btn.is_enabled():
+            sb.save_screenshot(f"renew_disabled_{sid}.png")
+            return {"status": "⏭️ 跳过", "message": "Renew 按钮存在但被禁用（可能积分不足或已达上限）"}
+    except Exception:
+        pass
+
     try:
         renew_btn.click()
     except Exception:
