@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Orihost 浏览器自动续期（SeleniumBase + 真浏览器）
+# 背景：面板 claim 接口强制要求 Cloudflare Turnstile token（GET /api/client/renewal/complete?cf-turnstile-response=xxx），
+#       纯 HTTP 调不通（无 token 直接 500），必须用真浏览器点验证。
+# 流程：Cookie 免登 → 服务器页 → Renew Now → Read Article（新标签读文章）→ 倒计时 → 点 Turnstile → Claim Renewal
+# 参考：katabump-renew-main（同款 Turnstile 处理 + xvfb 无头方案）
+
 import os
 import sys
 import time
@@ -11,11 +16,15 @@ from urllib.parse import unquote
 from seleniumbase import SB
 
 PANEL = "https://panel.orihost.com"
+# Laravel 默认 remember cookie 名（yanyumm1 实测 Orihost 可用）
 DEFAULT_REMEMBER_NAME = "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d"
+# 文章页停留秒数（面板 dwell=15，多留 buffer；“过早关闭文章页会被警告”）
 ARTICLE_WAIT = int(os.environ.get("ARTICLE_WAIT") or "30")
+# Claim 按钮轮询上限
 CLAIM_TIMEOUT = int(os.environ.get("CLAIM_TIMEOUT") or "150")
 
-
+# ---------- 代理 ----------
+# 优先级：ORIHOST_PROXY 显式指定 > 工作流 sing-box（IS_PROXY/PROXY_SERVER，由 NODE_LINK 转出）
 def _get_proxy():
     explicit = (os.environ.get("ORIHOST_PROXY") or os.environ.get("ORIHOST_GOST_PROXY") or "").strip()
     if explicit:
@@ -29,10 +38,10 @@ def _get_proxy():
         return srv
     return ""
 
-
 PROXY_STR = _get_proxy()
 IS_PROXY = bool(PROXY_STR)
 
+# ---------- Telegram ----------
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""
 if (not TG_BOT_TOKEN or not TG_CHAT_ID) and os.environ.get("TG_BOT"):
@@ -61,11 +70,13 @@ def now_bj():
     return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
 
+# ---------- 账号解析（与 orihost_renew.py 同一套变量名） ----------
 def _split_ids(raw: str):
     return [s.strip() for s in (raw or "").replace(";", ",").split(",") if s.strip()]
 
 
 def parse_auth_cookies(auth_raw: str):
+    """把用户填的 token 还原成 [(name, value)]，支持裸 token / name=value / 完整 Cookie 串"""
     v = (auth_raw or "").strip()
     if "remember_web" in v and (";" in v or "XSRF-TOKEN" in v or "jexactyl_session" in v):
         out = []
@@ -108,6 +119,7 @@ def load_accounts():
     return accounts
 
 
+# ---------- Turnstile 处理（移植自 katabump，经实测有效） ----------
 _EXPAND_JS = """
 (function() {
     var ts = document.querySelector('input[name="cf-turnstile-response"]');
@@ -191,6 +203,28 @@ def handle_turnstile(sb) -> bool:
     return False
 
 
+# ---------- 页面工具（文本匹配按钮，面板是 React，文本最稳） ----------
+def find_button_by_text(sb, *keywords, timeout=10):
+    """在 button 和 a 里找文本包含关键词的第一个可见元素"""
+    end = time.time() + timeout
+    kws = [k.lower() for k in keywords]
+    while time.time() < end:
+        try:
+            for el in sb.find_elements("button") + sb.find_elements("a"):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    txt = (el.text or "").strip().lower()
+                    if txt and any(k in txt for k in kws):
+                        return el
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        time.sleep(1)
+    return None
+
+
 def page_text(sb) -> str:
     try:
         return (sb.get_page_source() or "").lower()
@@ -198,6 +232,7 @@ def page_text(sb) -> str:
         return ""
 
 
+# ---------- Cookie 免登 ----------
 def cookie_login(sb, auth_raw: str) -> bool:
     print("🍪 Cookie 免登...")
     sb.open(PANEL + "/")
@@ -221,209 +256,47 @@ def cookie_login(sb, auth_raw: str) -> bool:
     return True
 
 
+# ---------- 单台续期 ----------
 def renew_one_server(sb, server_uuid: str) -> dict:
     sid = (server_uuid or "").split("-")[0][:8]
     print(f"\n  🖥 [{sid}] 打开服务器页...")
+    # 面板路由用的是 8 位短 ID（如 /server/8651e616），填了完整 UUID 也只取前 8 位
     sb.open(f"{PANEL}/server/{sid}")
     time.sleep(8)
+
     src = page_text(sb)
     if "renew limit reached" in src:
         return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
     if "expired renewal" in src or "suspended due" in src:
         print("  ⚠️ 服务器因过期被暂停，走续期流程恢复")
 
-    # ========== 1. 纯 JS 找并点击 Renew（安全版） ==========
-    print("  🔍 找 Renew 按钮（纯 JS 安全版）...")
-    print(f"  📍 当前 URL: {sb.get_current_url()}")
-    try:
-        print(f"  📄 页面标题: {sb.get_title()}")
-    except Exception:
-        pass
-
-    time.sleep(6)
-
-    try:
-        js_result = sb.execute_script("""
-            try {
-                function getClass(el) {
-                    try {
-                        if (typeof el.className === 'string') return el.className;
-                        return el.getAttribute('class') || '';
-                    } catch (e) {
-                        return '';
-                    }
-                }
-                function getText(el) {
-                    try {
-                        return (el.innerText || el.textContent || '').trim().replace(/\\n/g, ' ');
-                    } catch (e) {
-                        return '';
-                    }
-                }
-
-                const buttons = Array.from(document.querySelectorAll('button'));
-                const info = [];
-                for (let i = 0; i < buttons.length; i++) {
-                    const b = buttons[i];
-                    const text = getText(b);
-                    const cls = getClass(b).slice(0, 90);
-                    const disabled = !!(b.disabled || b.getAttribute('disabled') !== null ||
-                                       getClass(b).toLowerCase().indexOf('disabled') >= 0);
-                    let hasCalendar = false;
-                    try {
-                        hasCalendar = !!b.querySelector('svg[data-icon="calendar-plus"]');
-                    } catch (e) {}
-                    let visible = false;
-                    try {
-                        visible = !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length);
-                    } catch (e) {}
-                    info.push({
-                        index: i,
-                        text: text,
-                        class: cls,
-                        disabled: disabled,
-                        hasCalendar: hasCalendar,
-                        visible: visible
-                    });
-                }
-
-                let target = null;
-                // 优先：带 calendar-plus 且文字含 renew
-                for (const b of buttons) {
-                    const t = getText(b).toLowerCase();
-                    let hasCal = false;
-                    try { hasCal = !!b.querySelector('svg[data-icon="calendar-plus"]'); } catch (e) {}
-                    if (hasCal && t.indexOf('renew') >= 0) {
-                        target = b;
-                        break;
-                    }
-                }
-                // 其次：任意含 renew
-                if (!target) {
-                    for (const b of buttons) {
-                        if (getText(b).toLowerCase().indexOf('renew') >= 0) {
-                            target = b;
-                            break;
-                        }
-                    }
-                }
-                // 再其次：只有 calendar-plus 图标
-                if (!target) {
-                    for (const b of buttons) {
-                        try {
-                            if (b.querySelector('svg[data-icon="calendar-plus"]')) {
-                                target = b;
-                                break;
-                            }
-                        } catch (e) {}
-                    }
-                }
-
-                let clicked = false;
-                let disabled = false;
-                if (target) {
-                    const isDisabled = !!(target.disabled ||
-                                          target.getAttribute('disabled') !== null ||
-                                          getClass(target).toLowerCase().indexOf('disabled') >= 0);
-                    if (isDisabled) {
-                        disabled = true;
-                    } else {
-                        try {
-                            target.scrollIntoView({block: 'center', behavior: 'instant'});
-                        } catch (e) {}
-                        try {
-                            target.click();
-                            clicked = true;
-                        } catch (e) {
-                            try {
-                                target.dispatchEvent(new MouseEvent('click', {bubbles: true}));
-                                clicked = true;
-                            } catch (e2) {}
-                        }
-                    }
-                }
-
-                return {
-                    total: buttons.length,
-                    buttons: info,
-                    found: !!target,
-                    clicked: clicked,
-                    disabled: disabled,
-                    error: null
-                };
-            } catch (err) {
-                return {
-                    total: 0,
-                    buttons: [],
-                    found: false,
-                    clicked: false,
-                    disabled: false,
-                    error: String(err)
-                };
-            }
-        """)
-    except Exception as e:
-        print(f"  execute_script 异常: {e}")
-        sb.save_screenshot(f"js_error_{sid}.png")
-        return {"status": "❌ 续期失败", "message": f"JS 执行异常: {str(e)[:100]}"}
-
-    if js_result.get("error"):
-        print(f"  JS 内部错误: {js_result.get('error')}")
-        sb.save_screenshot(f"js_inner_error_{sid}.png")
-        return {"status": "❌ 续期失败", "message": f"JS 内部错误: {js_result.get('error')[:80]}"}
-
-    print(f"  JS 结果: total={js_result.get('total')} found={js_result.get('found')} "
-          f"clicked={js_result.get('clicked')} disabled={js_result.get('disabled')}")
-
-    for b in (js_result.get("buttons") or []):
-        print(f"    [{b.get('index')}] visible={b.get('visible')} disabled={b.get('disabled')} "
-              f"hasCalendar={b.get('hasCalendar')} text='{b.get('text')}' class='{b.get('class')}'")
-
-    if js_result.get("disabled"):
-        sb.save_screenshot(f"renew_disabled_{sid}.png")
-        return {"status": "⏭️ 跳过", "message": "Renew 按钮存在但被禁用（可能积分不足或已达上限）"}
-
-    if not js_result.get("found") or not js_result.get("clicked"):
+    # 1. 点 Renew Now
+    print("  🔍 找 Renew Now 按钮...")
+    renew_btn = find_button_by_text(sb, "renew now", timeout=20)
+    if renew_btn is None:
         sb.save_screenshot(f"no_renew_btn_{sid}.png")
-        try:
-            with open(f"page_source_{sid}.html", "w", encoding="utf-8") as f:
-                f.write(sb.get_page_source() or "")
-            print(f"  已保存 page_source_{sid}.html 和 no_renew_btn_{sid}.png")
-        except Exception:
-            pass
-        return {"status": "❌ 续期失败", "message": "没找到 Renew 按钮（页面结构可能变了）"}
-
-    print("  ✅ 已通过 JS 点击 Renew 按钮")
+        return {"status": "❌ 续期失败", "message": "没找到 Renew Now 按钮（页面结构可能变了）"}
+    try:
+        renew_btn.click()
+    except Exception:
+        sb.execute_script("arguments[0].click();", renew_btn)
     time.sleep(4)
 
-    # ========== 2. 点 Read Article ==========
+    # 2. 点 Read Article（会弹新标签）
     print("  🖱️ 点 Read Article...")
-    try:
-        read_clicked = sb.execute_script("""
-            try {
-                const buttons = Array.from(document.querySelectorAll('button, a'));
-                for (const b of buttons) {
-                    const t = (b.innerText || b.textContent || '').toLowerCase();
-                    if (t.indexOf('read article') >= 0) {
-                        try { b.scrollIntoView({block: 'center', behavior: 'instant'}); } catch (e) {}
-                        b.click();
-                        return true;
-                    }
-                }
-                return false;
-            } catch (e) {
-                return false;
-            }
-        """)
-    except Exception:
-        read_clicked = False
-
-    if not read_clicked:
+    read_btn = find_button_by_text(sb, "read article", timeout=15)
+    if read_btn is None:
+        # 可能已经在 reading 状态（倒计时中），直接往下走
         print("  ℹ️ 没找到 Read Article，可能已在倒计时，直接等待")
     else:
         before = set(sb.driver.window_handles)
+        try:
+            read_btn.click()
+        except Exception:
+            sb.execute_script("arguments[0].click();", read_btn)
+        # 等新标签出现
         article_handle = None
-        for _ in range(12):
+        for _ in range(10):
             time.sleep(1)
             after = set(sb.driver.window_handles)
             new = after - before
@@ -431,40 +304,22 @@ def renew_one_server(sb, server_uuid: str) -> dict:
                 article_handle = list(new)[0]
                 break
         if article_handle is None:
-            return {"status": "❌ 续期失败", "message": "文章页没弹出来（弹窗被拦）"}
-        print(f"  📰 文章页已打开，停留 {ARTICLE_WAIT}s...")
+            return {"status": "❌ 续期失败", "message": "文章页没弹出来（弹窗被拦，请加 --disable-popup-blocking）"}
+        print(f"  📰 文章页已打开，停留 {ARTICLE_WAIT}s（提前关闭会被警告）...")
         sb.driver.switch_to.window(article_handle)
         time.sleep(ARTICLE_WAIT)
         sb.driver.close()
         sb.driver.switch_to.window(list(before)[0])
         time.sleep(4)
 
-    # ========== 3. 等 Claim Renewal ==========
+    # 3. 等倒计时走完（Claim 按钮出现）
     print("  ⏳ 等倒计时走完，找 Claim Renewal...")
-    claim_found = False
-    for _ in range(60):
-        try:
-            claim_found = sb.execute_script("""
-                try {
-                    const buttons = Array.from(document.querySelectorAll('button'));
-                    for (const b of buttons) {
-                        const t = (b.innerText || b.textContent || '').toLowerCase();
-                        if (t.indexOf('claim renewal') >= 0) return true;
-                    }
-                    return false;
-                } catch (e) { return false; }
-            """)
-        except Exception:
-            claim_found = False
-        if claim_found:
-            break
-        time.sleep(2)
-
-    if not claim_found:
+    claim_btn = find_button_by_text(sb, "claim renewal", timeout=120)
+    if claim_btn is None:
         sb.save_screenshot(f"no_claim_btn_{sid}.png")
         return {"status": "❌ 续期失败", "message": "120s 没等到 Claim Renewal（倒计时异常）"}
 
-    # ========== 4. Turnstile ==========
+    # 4. 过 Turnstile（有才点，没有就跳过）
     try:
         has_ts = sb.execute_script(_HAS_TURNSTILE_JS)
     except Exception:
@@ -476,44 +331,27 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     else:
         print("  ℹ️ 未检测到验证组件")
 
-    # ========== 5. 点 Claim Renewal ==========
+    # 5. 点 Claim Renewal（等它从 disabled 变可点）
     print("  🖱️ 点 Claim Renewal...")
     claimed = False
     for _ in range(60):
         try:
-            claimed = sb.execute_script("""
-                try {
-                    function getClass(el) {
-                        try {
-                            if (typeof el.className === 'string') return el.className;
-                            return el.getAttribute('class') || '';
-                        } catch (e) { return ''; }
-                    }
-                    const buttons = Array.from(document.querySelectorAll('button'));
-                    for (const b of buttons) {
-                        const t = (b.innerText || b.textContent || '').toLowerCase();
-                        if (t.indexOf('claim renewal') >= 0 &&
-                            !b.disabled &&
-                            getClass(b).toLowerCase().indexOf('disabled') < 0) {
-                            try { b.scrollIntoView({block: 'center', behavior: 'instant'}); } catch (e) {}
-                            b.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                } catch (e) { return false; }
-            """)
+            btns = [el for el in sb.find_elements("button") if el.is_displayed() and "claim renewal" in (el.text or "").lower()]
+            if btns and btns[0].is_enabled():
+                try:
+                    btns[0].click()
+                except Exception:
+                    sb.execute_script("arguments[0].click();", btns[0])
+                claimed = True
+                break
         except Exception:
-            claimed = False
-        if claimed:
-            break
+            pass
         time.sleep(2)
-
     if not claimed:
         return {"status": "❌ 续期失败", "message": "Claim 按钮一直不可点（倒计时/验证没完成）"}
     time.sleep(8)
 
-    # ========== 6. 读结果 ==========
+    # 6. 读结果
     src = page_text(sb)
     if "renew limit reached" in src:
         return {"status": "⏭️ 跳过", "message": "已达续期上限（Renew Limit Reached）"}
@@ -530,6 +368,7 @@ def fmt_msg(status, label, server_uuid, detail):
     return f"🖥 Orihost 浏览器续期\n{status}\n👤 {label}\n🆔 {sid}\n📌 {detail}\n⏰ {now_bj()}（北京）"
 
 
+# ---------- 主入口 ----------
 def main():
     print("#" * 42)
     print("   Orihost 浏览器自动续期" + ("（代理开）" if IS_PROXY else "（直连）"))
@@ -538,16 +377,15 @@ def main():
     if not accounts:
         print("❌ 未配置账号。请设置 ORIHOST_REMEMBER + ORIHOST_SERVER_IDS ...")
         sys.exit(1)
-    sb_kwargs = {
-        "uc": True,
-        "headless": False,
-        "chromium_arg": "--disable-popup-blocking,--disable-notifications",
-    }
+
+    sb_kwargs = {"uc": True, "headless": False,
+                 "chromium_arg": "--disable-popup-blocking,--disable-notifications"}
     if IS_PROXY:
         print(f"🔗 挂载代理: {PROXY_STR}")
         sb_kwargs["proxy"] = PROXY_STR
     else:
         print("🌐 未使用代理，直连访问")
+
     results = []
     print("🚀 启动浏览器...")
     with SB(**sb_kwargs) as sb:
@@ -575,6 +413,7 @@ def main():
                 print(f"  {info['status']} {info['message']}")
                 send_tg(fmt_msg(info["status"], label, sv, info["message"]))
                 time.sleep(random.randint(2, 5))
+
     ok = sum(1 for r in results if "成功" in r["status"])
     skip = sum(1 for r in results if "跳过" in r["status"])
     fail = len(results) - ok - skip
