@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Orihost 浏览器自动续期（SeleniumBase + 真浏览器）
-# v2 Turnstile/Claim 强化版：保留 remember_web Cookie 登录与轮换
+# v4 Turnstile/广告状态机强化版：保留 remember_web Cookie 登录与轮换
 # 背景：面板 claim 接口强制要求 Cloudflare Turnstile token（GET /api/client/renewal/complete?cf-turnstile-response=xxx），
 #       纯 HTTP 调不通（无 token 直接 500），必须用真浏览器点验证。
-# 流程：Cookie 免登 → 服务器页 → Renew（打开对话框）→ Read Article（新标签读文章）→ 倒计时 → 点 Turnstile → Claim Renewal
+# 流程：Cookie 免登 → 服务器页 → Renew → Read Article → 倒计时 → 清广告/恢复续期弹窗 → Turnstile → Claim Renewal
 # 参考：katabump-renew-main（同款 Turnstile 处理 + xvfb 无头方案）
 
 import json
@@ -166,12 +166,11 @@ _SOLVED_JS = """
 
 _HAS_TURNSTILE_JS = """
 (function(){
-    if (document.querySelector('input[name="cf-turnstile-response"]')) return true;
-    var fs = document.querySelectorAll('iframe');
-    for (var i = 0; i < fs.length; i++) {
-        if (fs[i].src && fs[i].src.includes('challenges.cloudflare.com')) return true;
-    }
-    return false;
+    var token=document.querySelector('input[name="cf-turnstile-response"]');
+    if(token && String(token.value||'').length>20)return true;
+    function visible(el){try{var st=getComputedStyle(el),r=el.getBoundingClientRect();return st.display!=='none'&&st.visibility!=='hidden'&&parseFloat(st.opacity||'1')>0&&r.width>2&&r.height>2}catch(e){return false}}
+    function walk(root){try{var nodes=root.querySelectorAll?root.querySelectorAll('*'):[];for(var i=0;i<nodes.length;i++){var el=nodes[i];if(el.tagName==='IFRAME'){var src=(el.src||'').toLowerCase(),title=(el.title||'').toLowerCase();if((src.indexOf('challenges.cloudflare.com')>=0||title.indexOf('turnstile')>=0)&&visible(el))return true}var cls=String(el.className||'').toLowerCase();if(cls.indexOf('cf-turnstile')>=0&&visible(el))return true;if(el.shadowRoot&&walk(el.shadowRoot))return true}}catch(e){}return false}
+    return walk(document);
 })()
 """
 
@@ -180,63 +179,23 @@ _HAS_TURNSTILE_JS = """
 # 嘅固定遮罩（z-index 好高），正好盖住 Turnstile 组件 —— 唔清走佢，点极都点唔到 checkbox
 # （run 35452946138 截图实证：组件白框被广告盖住，Claim Renewal 一直 disabled）。
 _JS_KILL_AD = """
-(function () {
-    var out = [];
-    function hide(el, why) {
-        try {
-            el.style.setProperty('display', 'none', 'important');
-            out.push(why + ':' + el.tagName);
-        } catch (e) {}
-    }
-    var markers = ['download is ready', 'tap to proceed'];
-    var all = document.querySelectorAll('div,section,aside,iframe,ins');
-    for (var i = 0; i < all.length; i++) {
-        var el = all[i];
-        var t = (((el.innerText || el.textContent) || '')).toLowerCase().slice(0, 400);
-        if (!t) continue;
-        for (var j = 0; j < markers.length; j++) {
-            if (t.indexOf(markers[j]) < 0) continue;
-            var p = el;
-            for (var k = 0; k < 8 && p.parentElement; k++) {
-                var st = window.getComputedStyle(p);
-                var z = parseInt(st.zIndex || '0', 10);
-                if (st.position === 'fixed' || z >= 100) break;
-                p = p.parentElement;
-            }
-            hide(p, 'marker');
-            break;
-        }
-    }
-    var els = document.querySelectorAll('body > *, body > * > *');
-    for (var i = 0; i < els.length; i++) {
-        var el = els[i];
-        var st = window.getComputedStyle(el);
-        var z = parseInt(st.zIndex || '0', 10);
-        if (st.position !== 'fixed' && st.position !== 'absolute') continue;
-        if (z < 900) continue;
-        var r = el.getBoundingClientRect();
-        if (r.width * r.height < 0.2 * window.innerWidth * window.innerHeight) continue;
-        var txt = ((el.innerText || '') + '').toLowerCase();
-        if (txt.indexOf('renew your server') >= 0) continue;
-        hide(el, 'zindex' + z);
-    }
-    return out.join(' ') || 'none';
+(function(){
+ var out=[];function hide(el,why){try{el.style.setProperty('display','none','important');el.style.setProperty('visibility','hidden','important');el.style.setProperty('pointer-events','none','important');out.push(why+':'+el.tagName)}catch(e){}}
+ var markers=['download is ready','tap to proceed','continue to download','your download is ready'];
+ var all=document.querySelectorAll('div,section,aside,iframe,ins');
+ for(var i=0;i<all.length;i++){var el=all[i],t=((el.innerText||el.textContent)||'').toLowerCase().slice(0,500);if(!t)continue;for(var j=0;j<markers.length;j++){if(t.indexOf(markers[j])<0)continue;var p=el;for(var k=0;k<10&&p.parentElement;k++){var st=getComputedStyle(p),z=parseInt(st.zIndex||'0',10);if(st.position==='fixed'||st.position==='sticky'||z>=100)break;p=p.parentElement}hide(p,'marker');break}}
+ var els=document.querySelectorAll('body > *,body > * > *,body > * > * > *');
+ for(var n=0;n<els.length;n++){var e=els[n],st2=getComputedStyle(e),z2=parseInt(st2.zIndex||'0',10);if(st2.position!=='fixed'&&st2.position!=='absolute'&&st2.position!=='sticky')continue;if(z2<900)continue;var r=e.getBoundingClientRect();if(r.width*r.height<0.12*innerWidth*innerHeight)continue;var txt=((e.innerText||e.textContent)+'').toLowerCase(),cls=((e.className||'')+'').toLowerCase();var keep=txt.indexOf('renew your server')>=0||txt.indexOf('claim renewal')>=0||cls.indexOf('turnstile')>=0||cls.indexOf('modal')>=0||e.querySelector('input[name="cf-turnstile-response"]')||e.querySelector('iframe[src*="challenges.cloudflare.com"]');if(!keep)hide(e,'zindex'+z2)}
+ try{document.documentElement.style.removeProperty('overflow');document.body.style.removeProperty('overflow')}catch(e){}return out.join(' ')||'none';
 })()
 """
 
 _JS_TS_INFO = """
-(function () {
-    var inp = document.querySelector('input[name="cf-turnstile-response"]');
-    var out = {token: inp ? String(inp.value || '').length : -1, rects: []};
-    var fs = document.querySelectorAll('iframe');
-    for (var i = 0; i < fs.length; i++) {
-        var src = fs[i].src || '';
-        if (src.indexOf('challenges.cloudflare.com') < 0) continue;
-        var r = fs[i].getBoundingClientRect();
-        out.rects.push([Math.round(r.left), Math.round(r.top),
-                        Math.round(r.width), Math.round(r.height)]);
-    }
-    return JSON.stringify(out);
+(function(){
+ var inp=document.querySelector('input[name="cf-turnstile-response"]');var out={token:inp?String(inp.value||'').length:-1,rects:[],visible_rects:[],iframe_count:0,visible_iframe_count:0};
+ function visible(el){try{var st=getComputedStyle(el),r=el.getBoundingClientRect();return st.display!=='none'&&st.visibility!=='hidden'&&parseFloat(st.opacity||'1')>0&&r.width>2&&r.height>2}catch(e){return false}}
+ function walk(root){try{var nodes=root.querySelectorAll?root.querySelectorAll('*'):[];for(var i=0;i<nodes.length;i++){var f=nodes[i];if(f.tagName==='IFRAME'){var src=(f.src||'').toLowerCase(),title=(f.title||'').toLowerCase();if(src.indexOf('challenges.cloudflare.com')>=0||title.indexOf('turnstile')>=0){var r=f.getBoundingClientRect(),a=[Math.round(r.left),Math.round(r.top),Math.round(r.width),Math.round(r.height)];out.rects.push(a);out.iframe_count++;if(visible(f)){out.visible_rects.push(a);out.visible_iframe_count++}}}if(f.shadowRoot)walk(f.shadowRoot)}}catch(e){}}
+ walk(document);return JSON.stringify(out);
 })()
 """
 
@@ -362,6 +321,7 @@ def handle_turnstile(sb) -> bool:
       3. 原有 CDP iframe 坐标点击作为兜底。
     """
     print("🔍 处理 Cloudflare Turnstile 验证...")
+    kill_ad_overlay(sb)
     time.sleep(1.5)
 
     try:
@@ -424,10 +384,11 @@ def handle_turnstile(sb) -> bool:
                 rects = (info or {}).get("rects") or []
 
             if not rects:
-                print(
-                    f"  ⚠️ 第 {attempt} 轮仍未找到可定位的 Turnstile iframe；"
-                    "GUI 路径已尝试，等待 Cloudflare 重新渲染"
-                )
+                try:
+                    state=sb.execute_script(_JS_POST_ARTICLE_CLEANUP)
+                    print(f"    🔎 当前 Turnstile/页面状态: {state}")
+                except Exception: pass
+                print(f"  ⚠️ 第 {attempt} 轮没有真正的 Turnstile iframe/widget；不把孤立 response input 当验证码，等待页面重新渲染")
                 time.sleep(2)
                 continue
 
@@ -459,6 +420,43 @@ def handle_turnstile(sb) -> bool:
     print(f"  ❌ Turnstile {TURNSTILE_MAX_ATTEMPTS} 轮均未取得有效 token")
     return False
 
+_JS_POST_ARTICLE_CLEANUP = """
+(function(){
+ var out={url:location.href,state:'',response_inputs:0,token_len:0,iframes:0,visible_iframes:0};
+ function visible(el){try{var s=getComputedStyle(el),r=el.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&parseFloat(s.opacity||'1')>0&&r.width>2&&r.height>2}catch(e){return false}}
+ function walk(root){try{var ns=root.querySelectorAll?root.querySelectorAll('*'):[];for(var i=0;i<ns.length;i++){var e=ns[i];if(e.tagName==='IFRAME'){var src=(e.src||'').toLowerCase(),title=(e.title||'').toLowerCase();if(src.indexOf('challenges.cloudflare.com')>=0||title.indexOf('turnstile')>=0){out.iframes++;if(visible(e))out.visible_iframes++}}if(e.shadowRoot)walk(e.shadowRoot)}}catch(e){}}
+ var ins=document.querySelectorAll('input[name="cf-turnstile-response"]');out.response_inputs=ins.length;if(ins.length)out.token_len=String(ins[0].value||'').length;
+ var marks=['download is ready','tap to proceed','continue to download','your download is ready'];var all=document.querySelectorAll('div,section,aside,iframe,ins');
+ for(var j=0;j<all.length;j++){var e2=all[j],t=((e2.innerText||e2.textContent)||'').toLowerCase().slice(0,600),hit=false;for(var m=0;m<marks.length;m++){if(t.indexOf(marks[m])>=0){hit=true;break}}if(!hit)continue;var p=e2;for(var k=0;k<10&&p.parentElement;k++){var st=getComputedStyle(p),z=parseInt(st.zIndex||'0',10);if(st.position==='fixed'||z>=100)break;p=p.parentElement}var pt=((p.innerText||p.textContent)||'').toLowerCase(),pc=((p.className||'')+'').toLowerCase();if(pt.indexOf('renew your server')>=0||pt.indexOf('claim renewal')>=0||pc.indexOf('modal')>=0)continue;try{p.style.setProperty('display','none','important');p.style.setProperty('visibility','hidden','important');p.style.setProperty('pointer-events','none','important')}catch(e){}}
+ try{document.documentElement.style.removeProperty('overflow');document.body.style.removeProperty('overflow')}catch(e){}walk(document);
+ var bt=((document.body&&(document.body.innerText||document.body.textContent))||'').toLowerCase();out.state=bt.indexOf('you renewed recently')>=0?'cooldown':bt.indexOf('thanks for reading')>=0?'ready':bt.indexOf('you can claim your renewal in')>=0?'reading':bt.indexOf('click read article to open')>=0?'confirm':'closed';return JSON.stringify(out);
+})()
+"""
+
+def post_article_cleanup(sb,sid=''):
+    print('  🧹 文章倒计时结束，执行广告层/弹窗收尾清理...')
+    for i in range(3):
+        try:
+            kill_ad_overlay(sb);raw=sb.execute_script(_JS_POST_ARTICLE_CLEANUP);print(f'    清理第 {i+1}/3: {raw}')
+        except Exception as e: print(f'    ⚠️ 清理第 {i+1} 次失败: {str(e)[:100]}')
+        time.sleep(1)
+    try: href=str(sb.execute_script('return location.href') or '')
+    except Exception: href=''
+    if not href.startswith(PANEL+'/server/'):
+        print(f'    ⚠️ 当前页面不是 Orihost server 页面: {href[:160]}');return False
+    deadline=time.time()+8
+    while time.time()<deadline:
+        try:
+            info,_=ts_info(sb)
+            if info:
+                vis=info.get('visible_rects') or [];rects=info.get('rects') or [];token=int(info.get('token') or 0)
+                if token>20 or vis or rects:
+                    print(f'    ✅ 续期页面已恢复，Turnstile: token={token}, iframe={len(rects)}, visible={len(vis)}');return True
+        except Exception: pass
+        time.sleep(1)
+    try: print(f'    🔎 收尾后 Turnstile 状态: {ts_info(sb)[0]}')
+    except Exception: pass
+    return True
 def page_text(sb) -> str:
     try:
         return (sb.get_page_source() or "").lower()
