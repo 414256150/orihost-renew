@@ -274,6 +274,59 @@ def ts_click_cdp(sb, x, y):
         return "cdp-err:" + str(e)[:60]
 
 
+def _wait_turnstile_token(sb, timeout=TURNSTILE_TOKEN_WAIT):
+    """等待 Turnstile token 真正写入页面 DOM。"""
+    deadline = time.time() + timeout
+    last_len = 0
+    while time.time() < deadline:
+        try:
+            solved = bool(sb.execute_script(_SOLVED_JS))
+            if solved:
+                try:
+                    info = sb.execute_script(_JS_TS_INFO)
+                    if isinstance(info, dict):
+                        last_len = int(info.get("token_len") or info.get("token") or 0)
+                except Exception:
+                    pass
+                print(f"    ✅ Turnstile token 已生成，长度={last_len or '有效'}")
+                return True
+
+            info = sb.execute_script(_JS_TS_INFO)
+            if isinstance(info, dict):
+                raw = info.get("token_len", info.get("token", 0))
+                try:
+                    last_len = int(raw or 0)
+                except Exception:
+                    last_len = 0
+                if last_len >= 20:
+                    print(f"    ✅ Turnstile token 已生成，长度={last_len}")
+                    return True
+        except Exception:
+            pass
+        time.sleep(TURNSTILE_POLL_INTERVAL)
+    print(f"    ⚠️ Turnstile token 等待超时，最后长度={last_len}")
+    return False
+
+
+def _turnstile_click_points(rect):
+    """根据 iframe 矩形生成几个 checkbox 候选点击坐标。"""
+    # ts_info() 的 rect 是 [x, y, width, height]。
+    x, y, w, h = [float(v) for v in rect[:4]]
+    mid_y = y + max(h / 2.0, 18.0)
+    points = [
+        (x + min(max(24.0, w * 0.14), 42.0), mid_y),
+        (x + 24.0, y + min(max(32.0, h / 2.0), max(h - 8.0, 32.0))),
+        (x + 32.0, mid_y),
+    ]
+    out, seen = [], set()
+    for px, py in points:
+        key = (round(px, 1), round(py, 1))
+        if px > 0 and py > 0 and key not in seen:
+            seen.add(key)
+            out.append((px, py))
+    return out
+
+
 def _uc_gui_turnstile(sb):
     """优先使用 SeleniumBase/undetected-chromedriver 的 GUI CAPTCHA 点击器。
 
