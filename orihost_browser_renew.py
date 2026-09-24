@@ -250,15 +250,17 @@ def kill_ad_overlay(sb):
 
 
 def ts_info(sb):
-    """读 Turnstile 状态：token 长度 + 组件 iframe 视口坐标"""
+    """读 Turnstile 状态：token 长度 + 组件 iframe 视口坐标。"""
     try:
         raw = sb.execute_script(_JS_TS_INFO)
     except Exception as e:
         return None, "err:" + str(e)[:60]
-    try:
-        return json.loads(raw), None
-    except Exception:
-        return None, str(raw)[:80]
+
+    info = _parse_ts_info(raw)
+    if info:
+        return info, None
+
+    return None, str(raw)[:120]
 
 
 def ts_click_cdp(sb, x, y):
@@ -274,6 +276,19 @@ def ts_click_cdp(sb, x, y):
         return "cdp-err:" + str(e)[:60]
 
 
+def _parse_ts_info(raw):
+    """统一解析 _JS_TS_INFO：execute_script 返回的是 JSON 字符串。"""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
 def _wait_turnstile_token(sb, timeout=TURNSTILE_TOKEN_WAIT):
     """等待 Turnstile token 真正写入页面 DOM。"""
     deadline = time.time() + timeout
@@ -281,29 +296,21 @@ def _wait_turnstile_token(sb, timeout=TURNSTILE_TOKEN_WAIT):
     while time.time() < deadline:
         try:
             solved = bool(sb.execute_script(_SOLVED_JS))
-            if solved:
-                try:
-                    info = sb.execute_script(_JS_TS_INFO)
-                    if isinstance(info, dict):
-                        last_len = int(info.get("token_len") or info.get("token") or 0)
-                except Exception:
-                    pass
+            info = _parse_ts_info(sb.execute_script(_JS_TS_INFO))
+
+            raw_len = info.get("token_len", info.get("token", 0))
+            try:
+                last_len = int(raw_len or 0)
+            except Exception:
+                last_len = 0
+
+            if solved or last_len >= 20:
                 print(f"    ✅ Turnstile token 已生成，长度={last_len or '有效'}")
                 return True
-
-            info = sb.execute_script(_JS_TS_INFO)
-            if isinstance(info, dict):
-                raw = info.get("token_len", info.get("token", 0))
-                try:
-                    last_len = int(raw or 0)
-                except Exception:
-                    last_len = 0
-                if last_len >= 20:
-                    print(f"    ✅ Turnstile token 已生成，长度={last_len}")
-                    return True
         except Exception:
             pass
         time.sleep(TURNSTILE_POLL_INTERVAL)
+
     print(f"    ⚠️ Turnstile token 等待超时，最后长度={last_len}")
     return False
 
@@ -376,6 +383,22 @@ def handle_turnstile(sb) -> bool:
             if ok:
                 if _wait_turnstile_token(sb, timeout=TURNSTILE_TOKEN_WAIT):
                     return True
+                try:
+                    diag = sb.execute_script("""
+                    (function(){
+                        var i=document.querySelector('input[name="cf-turnstile-response"]');
+                        var fs=document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]');
+                        return {
+                          input: !!i,
+                          token_len: i ? String(i.value || '').length : 0,
+                          iframe_count: fs.length,
+                          url: location.href
+                        };
+                    })()
+                    """)
+                    print(f"    🔎 GUI 后 Turnstile DOM: {diag}")
+                except Exception as e:
+                    print(f"    ⚠️ GUI 后 DOM 诊断失败: {str(e)[:100]}")
                 print("    ⚠️ GUI 点击已执行，但 token 尚未生成，继续使用 CDP 兜底")
 
             # ===== 第二优先级：传统 DOM + CDP 坐标点击 =====
