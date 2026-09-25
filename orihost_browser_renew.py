@@ -1081,7 +1081,7 @@ def renew_one_server(sb, server_uuid: str) -> dict:
                 clicked = True
                 break
 
-            if res and res.get("disabled"):
+            if sres.startswith("disabled"):
                 print("    Claim Renewal 仍 disabled，继续等待 token/页面状态同步")
             else:
                 n_try += 1
