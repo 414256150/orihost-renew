@@ -1058,6 +1058,7 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     deadline = time.time() + CLAIM_TIMEOUT
 
     while time.time() < deadline:
+        kill_ad_overlay(sb)   # 先清广告遮罩，再检测/点击
         # 第一步：如果页面有 Turnstile，必须先拿到 token。
         try:
             has_ts = bool(sb.execute_script(_HAS_TURNSTILE_JS))
