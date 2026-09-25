@@ -166,11 +166,12 @@ _SOLVED_JS = """
 
 _HAS_TURNSTILE_JS = """
 (function(){
-    var token=document.querySelector('input[name="cf-turnstile-response"]');
-    if(token && String(token.value||'').length>20)return true;
-    function visible(el){try{var st=getComputedStyle(el),r=el.getBoundingClientRect();return st.display!=='none'&&st.visibility!=='hidden'&&parseFloat(st.opacity||'1')>0&&r.width>2&&r.height>2}catch(e){return false}}
-    function walk(root){try{var nodes=root.querySelectorAll?root.querySelectorAll('*'):[];for(var i=0;i<nodes.length;i++){var el=nodes[i];if(el.tagName==='IFRAME'){var src=(el.src||'').toLowerCase(),title=(el.title||'').toLowerCase();if((src.indexOf('challenges.cloudflare.com')>=0||title.indexOf('turnstile')>=0)&&visible(el))return true}var cls=String(el.className||'').toLowerCase();if(cls.indexOf('cf-turnstile')>=0&&visible(el))return true;if(el.shadowRoot&&walk(el.shadowRoot))return true}}catch(e){}return false}
-    return walk(document);
+    if (document.querySelector('input[name="cf-turnstile-response"]')) return true;
+    var fs = document.querySelectorAll('iframe');
+    for (var i = 0; i < fs.length; i++) {
+        if (fs[i].src && fs[i].src.includes('challenges.cloudflare.com')) return true;
+    }
+    return false;
 })()
 """
 
