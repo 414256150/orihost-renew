@@ -49,6 +49,10 @@ jobs:
           GH_ROTATE_TOKEN: ${{ secrets.GH_ROTATE_TOKEN }}
           RENEWAL_MAX: '21'
           MAX_ATTEMPTS: '5'
+          CLAIM_TIMEOUT: '600'          # 整个 Claim 阶段总时限：150 → 600s
+          TURNSTILE_TOKEN_WAIT: '45'    # 每次点击后等 token：12 → 45s
+          TURNSTILE_MAX_ATTEMPTS: '6'   # 轮数 8 → 6（每轮更久，总数不用那么多）
+          CLAIM_ENABLE_WAIT: '60'       # 等 Claim 按钮解锁窗口：25 → 60s
         run: |
           echo "IS_PROXY=$IS_PROXY | PROXY_SERVER=$PROXY_SERVER"
           pip install pynacl 2>&1 | tail -1
