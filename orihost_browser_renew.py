@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Orihost 浏览器自动续期（SeleniumBase + 真浏览器）
-# v4 Turnstile/广告状态机强化版：保留 remember_web Cookie 登录与轮换
+# v5 广告弹层点击关闭 + 组件挂载等待版：保留 remember_web Cookie 登录与轮换
 # 背景：面板 claim 接口强制要求 Cloudflare Turnstile token（GET /api/client/renewal/complete?cf-turnstile-response=xxx），
 #       纯 HTTP 调不通（无 token 直接 500），必须用真浏览器点验证。
-# 流程：Cookie 免登 → 服务器页 → Renew → Read Article → 倒计时 → 清广告/恢复续期弹窗 → Turnstile → Claim Renewal
+# 流程：Cookie 免登 → 服务器页 → Renew → Read Article → 倒计时 → 关广告/清覆盖层 → 等组件挂载 → Turnstile → Claim Renewal
 # 参考：katabump-renew-main（同款 Turnstile 处理 + xvfb 无头方案）
 
 import json
@@ -32,6 +32,9 @@ TURNSTILE_MAX_ATTEMPTS = max(1, int(os.environ.get("TURNSTILE_MAX_ATTEMPTS") or 
 TURNSTILE_TOKEN_WAIT = max(3, int(os.environ.get("TURNSTILE_TOKEN_WAIT") or "12"))
 TURNSTILE_POLL_INTERVAL = max(0.5, float(os.environ.get("TURNSTILE_POLL_INTERVAL") or "1"))
 CLAIM_ENABLE_WAIT = max(5, int(os.environ.get("CLAIM_ENABLE_WAIT") or "25"))
+# 验证组件（CF iframe）挂载等待：面板 2026-09 末版可能要等广告被关掉才挂组件；
+# 等不到会返回 None 让调用方直接去点 Claim（组件可能在点击后才出现）
+TURNSTILE_WIDGET_WAIT = max(10, int(os.environ.get("TURNSTILE_WIDGET_WAIT") or "90"))
 
 # ---------- 代理 ----------
 # 优先级：ORIHOST_PROXY 显式指定 > 工作流 sing-box（IS_PROXY/PROXY_SERVER，由 NODE_LINK 转出）
@@ -177,17 +180,68 @@ _HAS_TURNSTILE_JS = """
 
 
 # 面板免费方案会插广告：续期对话框弹出时，中间会有个「Download is ready / Tap to proceed」
-# 嘅固定遮罩（z-index 好高），正好盖住 Turnstile 组件 —— 唔清走佢，点极都点唔到 checkbox
-# （run 35452946138 截图实证：组件白框被广告盖住，Claim Renewal 一直 disabled）。
+# 嘅跨域广告 iframe，正好压住 Turnstile 组件 —— 跨域 iframe 嘅文字父页面读唔到，
+# 所以除咗原有文案匹配，再加「几何法」：喺组件矩形上采样 elementFromPoint，
+# 边个盖住组件就藏边个（run 36215402050 截图实证：广告弹层压住组件只剩顶边露出，
+# Claim Renewal 一直 disabled，往组件坐标点嘅 CDP 点击全部点喺广告上面）。
 _JS_KILL_AD = """
 (function(){
- var out=[];function hide(el,why){try{el.style.setProperty('display','none','important');el.style.setProperty('visibility','hidden','important');el.style.setProperty('pointer-events','none','important');out.push(why+':'+el.tagName)}catch(e){}}
+ var out=[];
+ function hide(el,why){try{el.style.setProperty('display','none','important');el.style.setProperty('visibility','hidden','important');el.style.setProperty('pointer-events','none','important');out.push(why+':'+el.tagName)}catch(e){}}
  var markers=['download is ready','tap to proceed','continue to download','your download is ready'];
  var all=document.querySelectorAll('div,section,aside,iframe,ins');
  for(var i=0;i<all.length;i++){var el=all[i],t=((el.innerText||el.textContent)||'').toLowerCase().slice(0,500);if(!t)continue;for(var j=0;j<markers.length;j++){if(t.indexOf(markers[j])<0)continue;var p=el;for(var k=0;k<10&&p.parentElement;k++){var st=getComputedStyle(p),z=parseInt(st.zIndex||'0',10);if(st.position==='fixed'||st.position==='sticky'||z>=100)break;p=p.parentElement}hide(p,'marker');break}}
+ var ts=document.querySelector('input[name="cf-turnstile-response"]');
+ if(ts){var tr=null,e2=ts;
+  for(var m=0;m<10&&e2.parentElement;m++){e2=e2.parentElement;var r0=e2.getBoundingClientRect();if(r0.width>=200&&r0.height>=40){tr=r0;break}}
+  if(tr){var pts=[[tr.left+tr.width/2,tr.top+tr.height/2],[tr.left+24,tr.top+tr.height/2],[tr.left+tr.width-24,tr.top+tr.height/2],[tr.left+tr.width/2,tr.top+12],[tr.left+tr.width/2,tr.bottom-8]];
+   for(var q=0;q<pts.length;q++){var top=document.elementFromPoint(pts[q][0],pts[q][1]);if(!top)continue;if(top===ts)continue;if((top.tagName==='IFRAME')&&(top.src||'').indexOf('challenges.cloudflare.com')>=0)continue;if(top.contains(ts)||ts.contains(top))continue;var t2=top;for(var w=0;w<8&&t2.parentElement;w++){var st2=getComputedStyle(t2);if(st2.position==='fixed'||st2.position==='absolute'||st2.position==='sticky'||parseInt(st2.zIndex||'0',10)>=100)break;t2=t2.parentElement}hide(t2,'cover'+q)}}}
  var els=document.querySelectorAll('body > *,body > * > *,body > * > * > *');
- for(var n=0;n<els.length;n++){var e=els[n],st2=getComputedStyle(e),z2=parseInt(st2.zIndex||'0',10);if(st2.position!=='fixed'&&st2.position!=='absolute'&&st2.position!=='sticky')continue;if(z2<900)continue;var r=e.getBoundingClientRect();if(r.width*r.height<0.12*innerWidth*innerHeight)continue;var txt=((e.innerText||e.textContent)+'').toLowerCase(),cls=((e.className||'')+'').toLowerCase();var keep=txt.indexOf('renew your server')>=0||txt.indexOf('claim renewal')>=0||cls.indexOf('turnstile')>=0||cls.indexOf('modal')>=0||e.querySelector('input[name="cf-turnstile-response"]')||e.querySelector('iframe[src*="challenges.cloudflare.com"]');if(!keep)hide(e,'zindex'+z2)}
- try{document.documentElement.style.removeProperty('overflow');document.body.style.removeProperty('overflow')}catch(e){}return out.join(' ')||'none';
+ for(var n=0;n<els.length;n++){var e=els[n],st3=getComputedStyle(e),z2=parseInt(st3.zIndex||'0',10);if(st3.position!=='fixed'&&st3.position!=='absolute'&&st3.position!=='sticky')continue;if(z2<900)continue;var r=e.getBoundingClientRect();if(r.width*r.height<0.12*innerWidth*innerHeight)continue;var txt=((e.innerText||e.textContent)+'').toLowerCase(),cls=((e.className||'')+'').toLowerCase();var keep=txt.indexOf('renew your server')>=0||txt.indexOf('claim renewal')>=0||cls.indexOf('turnstile')>=0||cls.indexOf('modal')>=0||e.querySelector('input[name="cf-turnstile-response"]')||e.querySelector('iframe[src*="challenges.cloudflare.com"]');if(!keep)hide(e,'zindex'+z2)}
+ try{document.documentElement.style.removeProperty('overflow');document.body.style.removeProperty('overflow')}catch(e){}
+ return out.join(' ')||'none';
+})()
+"""
+
+# 广告弹层定位：优先以 Turnstile 组件为锚（elementFromPoint 找出盖住佢嘅顶层元素，
+# 返回佢哋嘅定位容器矩形俾 Python 用 CDP 点 Close）；
+# 组件还没挂载时，退而求其次搵弹窗区域里疑似广告弹层嘅 iframe
+# （跨域读唔到文字，只能靠几何尺寸+位置判断）。
+_JS_AD_COVERS = """
+(function(){
+ function container(el){var t=el;for(var k=0;k<8&&t.parentElement;k++){var st=getComputedStyle(t);if(st.position==='fixed'||st.position==='absolute'||st.position==='sticky'||parseInt(st.zIndex||'0',10)>=100)break;t=t.parentElement}return t}
+ var out=[],tr=null;
+ var ts=document.querySelector('input[name="cf-turnstile-response"]');
+ if(ts){
+  var e2=ts;
+  for(var m=0;m<10&&e2.parentElement;m++){e2=e2.parentElement;var r0=e2.getBoundingClientRect();if(r0.width>=200&&r0.height>=40){tr=r0;break}}
+  if(tr){
+   var pts=[[tr.left+tr.width/2,tr.top+tr.height/2],[tr.left+24,tr.top+tr.height/2],[tr.left+tr.width-24,tr.top+tr.height/2],[tr.left+tr.width/2,tr.top+12],[tr.left+tr.width/2,tr.bottom-8]];
+   var seen={};
+   for(var q=0;q<pts.length;q++){
+    var top=document.elementFromPoint(pts[q][0],pts[q][1]);
+    if(!top)continue;
+    if(top===ts)continue;
+    if((top.tagName==='IFRAME')&&(top.src||'').indexOf('challenges.cloudflare.com')>=0)continue;
+    if(top.contains(ts)||ts.contains(top))continue;
+    var c=container(top),r=c.getBoundingClientRect(),key=c.tagName+Math.round(r.left)+','+Math.round(r.top);
+    if(seen[key])continue;seen[key]=1;
+    out.push([Math.round(r.left),Math.round(r.top),Math.round(r.width),Math.round(r.height)]);
+   }
+  }
+ }else{
+  var els=document.querySelectorAll('iframe');
+  for(var i=0;i<els.length&&out.length<3;i++){
+   var el=els[i],r=el.getBoundingClientRect();
+   if(r.width<150||r.height<70||r.width>900||r.height>700)continue;
+   if(r.top<innerHeight*0.08||r.top>innerHeight*0.75)continue;
+   var src=((el.getAttribute&&el.getAttribute('src'))||'').toLowerCase();
+   if(src.indexOf('challenges.cloudflare.com')>=0)continue;
+   var c2=container(el),rr=c2.getBoundingClientRect();
+   out.push([Math.round(rr.left),Math.round(rr.top),Math.round(rr.width),Math.round(rr.height)]);
+  }
+ }
+ return JSON.stringify(out);
 })()
 """
 
@@ -202,11 +256,33 @@ _JS_TS_INFO = """
 
 
 def kill_ad_overlay(sb):
-    """清走盖住 Turnstile 嘅广告遮罩；返清咗几多个"""
+    """关掉盖住 Turnstile 组件的广告弹层：
+    ① 定位覆盖层，用 CDP 点它自己的 Close（面板流程可能要求真关闭才肯挂验证组件）；
+    ② 点唔走嘅再按几何位置藏掉（跨域 iframe 读唔到文字，纯文案匹配对佢无效）。
+    只点 Close 唔点 Continue——Continue 係广告跳转按钮，点咗可能直接离开页面。"""
+    report = []
     try:
-        return sb.execute_script(_JS_KILL_AD)
+        raw = sb.execute_script(_JS_AD_COVERS)
+        covers = json.loads(raw) if isinstance(raw, str) else []
     except Exception as e:
-        return "err:" + str(e)[:60]
+        covers = []
+        report.append("find:" + str(e)[:50])
+    for rect in covers[:3]:
+        try:
+            x, y, w, h = [float(v) for v in rect[:4]]
+        except Exception:
+            continue
+        if w < 100 or h < 60:
+            continue
+        cx, cy = x + w * 0.19, y + h * 0.78   # 截图实测：Close 在弹层左下角
+        res = ts_click_cdp(sb, cx, cy)
+        report.append(f"Close({int(cx)},{int(cy)})→{res}")
+        time.sleep(1.2)
+    try:
+        report.append("清理:" + str(sb.execute_script(_JS_KILL_AD)))
+    except Exception as e:
+        report.append("清理异常:" + str(e)[:60])
+    return " | ".join(report) if report else "无覆盖层"
 
 
 def ts_info(sb):
@@ -313,13 +389,17 @@ def _uc_gui_turnstile(sb):
         return False, str(e)[:160]
 
 
-def handle_turnstile(sb) -> bool:
+def handle_turnstile(sb):
     """处理续期对话框内的 Cloudflare Turnstile。
+
+    返回值：True=已拿到 token；False=组件有挂载但多轮尝试拿唔到 token（真失败）；
+            None=组件一直没挂载（唔算失败，调用方应继续去点 Claim Renewal）。
 
     处理优先级：
       1. 已有 token 直接通过；
-      2. SeleniumBase uc_gui_click_captcha()（不依赖 iframe DOM 定位）；
-      3. 原有 CDP iframe 坐标点击作为兜底。
+      2. 等待组件挂载（边清广告边等）；
+      3. SeleniumBase uc_gui_click_captcha()（不依赖 iframe DOM 定位）；
+      4. 原有 CDP iframe 坐标点击作为兜底。
     """
     print("🔍 处理 Cloudflare Turnstile 验证...")
     kill_ad_overlay(sb)
@@ -331,6 +411,43 @@ def handle_turnstile(sb) -> bool:
             return True
     except Exception:
         pass
+
+    # 先确认验证组件真的挂载了（页面里有 CF iframe）。面板 2026-09 末版可能要
+    # 等广告被关掉才挂组件 → 每隔几秒点一次广告 Close + 藏覆盖层，等佢挂载。
+    # 等唔到就返回 None：调用方唔会当失败，会继续去点 Claim Renewal
+    # （面板若系「点了 Claim 才挂验证」或隐形验证模式，呢一下就係触发条件）。
+    def _widget_mounted():
+        try:
+            return bool(sb.execute_script(
+                "(function(){var f=document.querySelectorAll('iframe');"
+                "for(var i=0;i<f.length;i++){if((f[i].src||'').indexOf('challenges.cloudflare.com')>=0)return true}"
+                "return false})()"))
+        except Exception:
+            return False
+
+    if not _widget_mounted():
+        print(f"  ℹ️ 页面里还没有 Turnstile iframe，边清广告边等它挂载（最多 {TURNSTILE_WIDGET_WAIT}s）...")
+        end = time.time() + TURNSTILE_WIDGET_WAIT
+        mounted = False
+        while time.time() < end:
+            try:
+                kill_ad_overlay(sb)
+            except Exception:
+                pass
+            time.sleep(3)
+            try:
+                if sb.execute_script(_SOLVED_JS):
+                    print("  ✅ 等待期间 token 已生成")
+                    return True
+            except Exception:
+                pass
+            if _widget_mounted():
+                print("  ✅ 验证组件已挂载，开始处理")
+                mounted = True
+                break
+        if not mounted:
+            print("  ⚠️ 等待超时仍未见验证组件，改为直接尝试点 Claim Renewal")
+            return None
 
     for attempt in range(1, TURNSTILE_MAX_ATTEMPTS + 1):
         print(f"  🔄 Turnstile 第 {attempt}/{TURNSTILE_MAX_ATTEMPTS} 轮")
@@ -1058,7 +1175,7 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     deadline = time.time() + CLAIM_TIMEOUT
 
     while time.time() < deadline:
-        kill_ad_overlay(sb)   # 先清广告遮罩，再检测/点击
+        kill_ad_overlay(sb)   # 先点掉/清掉广告遮罩，再检测/点击
         # 第一步：如果页面有 Turnstile，必须先拿到 token。
         try:
             has_ts = bool(sb.execute_script(_HAS_TURNSTILE_JS))
@@ -1071,6 +1188,7 @@ def renew_one_server(sb, server_uuid: str) -> dict:
             if ts_state is False:
                 sb.save_screenshot(f"turnstile_fail_{sid}.png")
                 return {"status": "❌ 续期失败", "message": f"Turnstile 验证 {TURNSTILE_MAX_ATTEMPTS} 次未通过"}
+            # ts_state 为 None（组件一直没挂载）唔算失败，落去照点 Claim
             time.sleep(1)
 
         # 第二步：等待 Claim 按钮解除 disabled，再点击。
