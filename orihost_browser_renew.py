@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Orihost 浏览器自动续期（SeleniumBase + 真浏览器）
+# v12 2026-10-04：run 37158461182（v11）复盘——看门狗修好后第一次看到真实死亡：
+#   Step B 到达、广告 Close 被 CDP 点击后，execute_script 开始返回 None，随后持续抛异常
+#   150s。最大嫌疑是 CDP 可信点击打偏/点到广告导致页面导航或上下文失效。
+#   本版：① 看门狗打印真实异常信息（之前只打印“无响应”，等于盲飞）；
+#   ② 判死时记录当前 URL + 尝试读 page source + 截图；
+#   ③ kill_ad_overlay 改为只隐藏不真点（_JS_KILL_AD 几何/文案隐藏），不再用 CDP
+#      可信点击去点广告 Close——隐藏足以让出 Turnstile，真点有导航风险。
 # v11 2026-10-04：一行修复——js_health 的 repr() 比较 bug（见函数内注释）。
 #   之前所有版本的看门狗在通道健康时也判死，Step B/Turnstile/Claim 从未被真正尝试过。
 # v10 2026-10-03：在用户版（v8+load_accounts 多账号）上合入 v9 弹窗处理：
@@ -375,23 +382,11 @@ def kill_ad_overlay(sb):
     """关掉盖住 Turnstile 组件的广告弹层：
     ① 定位覆盖层，用 CDP 点它自己的 Close（面板流程可能要求真关闭才肯挂验证组件）；
     ② 点唔走嘅再按几何位置藏掉（跨域 iframe 读唔到文字，纯文案匹配对佢无效）。
-    只点 Close 唔点 Continue——Continue 係广告跳转按钮，点咗可能直接离开页面。
-    v10：先找弹层上真正的 Close/✕ 按钮坐标再点，找不到才用几何经验坐标兜底。"""
+    v12 起只隐藏、不再用 CDP 可信点击去点广告 Close：
+    run 37158461182 显示，CDP 点击广告 Close 后通道死亡（疑似点偏导致页面导航/
+    上下文失效）。隐藏（display:none）足以让出 Turnstile，且零导航风险。
+    _JS_FIND_AD_CLOSE 保留备用，不再调用。"""
     report = []
-    try:
-        raw = sb.execute_script(_JS_FIND_AD_CLOSE)
-        btns = json.loads(raw) if isinstance(raw, str) else []
-    except Exception as e:
-        btns = []
-        report.append("找Close按钮:" + str(e)[:50])
-    for pt in btns[:3]:
-        try:
-            cx, cy = float(pt[0]), float(pt[1])
-        except Exception:
-            continue
-        res = ts_click_cdp(sb, cx, cy)
-        report.append(f"真Close({int(cx)},{int(cy)})→{res}")
-        time.sleep(1.2)
     try:
         raw = sb.execute_script(_JS_AD_COVERS)
         covers = json.loads(raw) if isinstance(raw, str) else []
@@ -1074,16 +1069,18 @@ def wait_modal_state(sb, target, timeout, note="", main_handle=None):
     bad_since = None
     while time.time() < end:
         polls += 1
-        if js_health(sb) != "pong:2":
+        h = js_health(sb)
+        if h != "pong:2":
             if bad_since is None:
                 bad_since = time.time()
-                print("    ⚠️ 读状态时 JS 通道无响应，等待恢复…")
+                print(f"    ⚠️ 读状态时 JS 通道无响应，等待恢复…（{h[:90]}）")
             waited = int(time.time() - bad_since)
             if waited >= CDP_RECOVER_WAIT:
-                print(f"    ⚠️ JS 通道持续 {waited}s 无响应，判定中断")
+                print(f"    ⚠️ JS 通道持续 {waited}s 无响应，判定中断（{h[:90]}）")
+                _dump_dead_diag(sb, "modal")
                 return "cdp-dead"
             if waited % 15 == 0:
-                print(f"    …通道仍无响应（已 {waited}s）")
+                print(f"    …通道仍无响应（已 {waited}s，{h[:90]}）")
             time.sleep(3)
             continue
         if bad_since is not None:
@@ -1288,6 +1285,24 @@ def _article_to_ready(sb, sid, main_handle=None):
     return st if st else "not-ready"
 
 
+def _dump_dead_diag(sb, tag):
+    """通道判死时的现场取证：URL + page source 是否可读 + 截图。"""
+    try:
+        print(f"    🔎 [{tag}] 当前 URL: {sb.driver.current_url}")
+    except Exception as e:
+        print(f"    🔎 [{tag}] URL 读取失败: {str(e)[:80]}")
+    try:
+        src = sb.get_page_source() or ""
+        print(f"    🔎 [{tag}] page_source 可读，长度 {len(src)}")
+    except Exception as e:
+        print(f"    🔎 [{tag}] page_source 读取失败: {str(e)[:80]}")
+    try:
+        sb.save_screenshot(f"cdp_dead_{tag}.png")
+        print(f"    🔎 [{tag}] 已截图 cdp_dead_{tag}.png")
+    except Exception as e:
+        print(f"    🔎 [{tag}] 截图失败: {str(e)[:80]}")
+
+
 def wait_claim_ready(sb, timeout, main_handle=None):
     """Step B 专用的 Claim 等待：Turnstile 挂载→验证→按钮可用→点击。
 
@@ -1302,16 +1317,18 @@ def wait_claim_ready(sb, timeout, main_handle=None):
     while time.time() < end:
         n += 1
         # —— 看门狗：JS 通道健康（容忍短暂卡死，持续超 CDP_RECOVER_WAIT 才判死） ——
-        if js_health(sb) != "pong:2":
+        h = js_health(sb)
+        if h != "pong:2":
             if bad_since is None:
                 bad_since = time.time()
-                print("    ⚠️ JS 通道无响应，等待恢复…")
+                print(f"    ⚠️ JS 通道无响应，等待恢复…（{h[:90]}）")
             waited = int(time.time() - bad_since)
             if waited >= CDP_RECOVER_WAIT:
-                print(f"    ⚠️ JS 通道持续 {waited}s 无响应，判定中断")
+                print(f"    ⚠️ JS 通道持续 {waited}s 无响应，判定中断（{h[:90]}）")
+                _dump_dead_diag(sb, "claim")
                 return "cdp-dead"
             if waited % 15 == 0:
-                print(f"    …通道仍无响应（已 {waited}s）")
+                print(f"    …通道仍无响应（已 {waited}s，{h[:90]}）")
             time.sleep(3)
             continue
         if bad_since is not None:
