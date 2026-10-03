@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Orihost 浏览器自动续期（SeleniumBase + 真浏览器）
+# v7 2026-10-03 run 37126904215 复盘追加：
+#   - Step B 开始时页面 JS 通道会卡死约 1 分钟后自行恢复（疑似 Turnstile 挂载时
+#     Cloudflare 在数据中心 IP 上做挑战/重载）。看门狗改成耐心等 90s（CDP_RECOVER_WAIT），
+#     不再 3 次就判死，避免误杀可恢复的抖动。
+#   - 主流程改成最多 2 轮完整重试：文章→Step B→Claim 整轮重做；旧恢复逻辑漏了
+#     重开后重点 Read Article 的 bug 已修（_article_to_ready 抽成复用函数）。
 # v6 2026-10-03 按真实页面重写 Claim 阶段：保留 remember_web Cookie 登录与轮换
 # 背景：面板 claim 接口强制要求 Cloudflare Turnstile token（GET /api/client/renewal/complete?cf-turnstile-response=xxx），
 #       纯 HTTP 调不通（无 token 直接 500），必须用真浏览器点验证。
@@ -49,6 +55,10 @@ CLAIM_ENABLE_WAIT = max(5, int(os.environ.get("CLAIM_ENABLE_WAIT") or "25"))
 # 验证组件（CF iframe）挂载等待：面板 2026-09 末版可能要等广告被关掉才挂组件；
 # 等不到会返回 None 让调用方直接去点 Claim（组件可能在点击后才出现）
 TURNSTILE_WIDGET_WAIT = max(10, int(os.environ.get("TURNSTILE_WIDGET_WAIT") or "90"))
+# JS 通道抖动恢复等待：Step B 挂载 Turnstile 时 Cloudflare 可能让页面卡住几十秒
+# （2026-10-03 run 37126904215 实证：通道卡死约 1 分钟后自行恢复）；
+# 通道持续无响应超过此时长才判死，不再 3 次就判死
+CDP_RECOVER_WAIT = max(30, int(os.environ.get("CDP_RECOVER_WAIT") or "90"))
 
 # ---------- 代理 ----------
 # 优先级：ORIHOST_PROXY 显式指定 > 工作流 sing-box（IS_PROXY/PROXY_SERVER，由 NODE_LINK 转出）
@@ -1070,6 +1080,71 @@ def save_rotated_cookies(sb):
         print(f"  ⚠️ 写回 secret 失败（不影响续期）: {str(e)[:120]}")
 
 
+
+def _article_to_ready(sb, sid):
+    """点 Read Article → 等对话框进入 Step B（"Thanks for reading!"）。
+
+    返回: "ready" / "cooldown"（刚续期过）/ 其他状态字符串（"confirm"/"not-ready" 等）。
+    设计成可复用：主流程第一轮用，CDP 中断恢复的第二轮也调它（2026-10-03 run 37126904215
+    教训：恢复时只重开了对话框、没重点 Read Article，导致永远卡在 Step A）。
+    """
+    # 垫片幂等：JS 合成 click 冇 user activation，Chrome 会拦截 window.open；
+    # 垫片返假 window 令面板状态机行得落去（run 35450777798 实证）。
+    print("  \U0001fa79 装 window.open 垫片...")
+    try:
+        print("    ", sb.execute_script(_JS_PATCH_WINDOW_OPEN))
+    except Exception as e:
+        print("  \u26a0\ufe0f 垫片失败:", str(e)[:80])
+    try:
+        print("    XHR 诊断钩:", sb.execute_script(_JS_PATCH_XHR))
+    except Exception as e:
+        print("  \u26a0\ufe0f XHR 钩失败:", str(e)[:80])
+
+    print("  \U0001f5b1\ufe0f 点 Read Article...")
+    read_res = click_by_text(sb, "read article", timeout=15)
+    print(f"    {read_res}")
+    if not str(read_res).startswith("clicked"):
+        print(f"  \u26a0\ufe0f Read Article 未点中（{read_res}）")
+        return "confirm"
+    time.sleep(2)
+
+    # 等面板 POST /renew/begin 返文章 URL，用页面内 fetch 触发一次请求（唔开真标签；
+    # Target.createTarget 会搞烂 CDP 连线 —— run 35452477886 实证）。
+    art_url = ""
+    for _ in range(20):
+        try:
+            art_url = str(sb.execute_script(_JS_GET_ARTICLE_URL) or "")
+        except Exception:
+            art_url = ""
+        if art_url.startswith("http"):
+            break
+        time.sleep(1)
+    if art_url.startswith("http"):
+        try:
+            sb.execute_script(
+                "(function(){try{fetch(%s,{credentials:'include',mode:'no-cors'})"
+                ".catch(function(){})}catch(e){}return 'fetched'})()" % json.dumps(art_url)
+            )
+            print("    \U0001f4c4 已用页面内 fetch 触发一次文章请求（唔开新标签）")
+        except Exception as e:
+            print(f"    （fetch 文章页失败，唔影响: {str(e)[:60]}）")
+    else:
+        print(f"  \u26a0\ufe0f 未拿到文章 URL（面板可能仍在 confirm），read_res={read_res}")
+
+    # 等 Step B：2026-10-03 起新版对话框无数字倒计时，纯文字等待；
+    # 旧版数字倒计时（"claim your renewal in N"）若出现仍兼容。
+    print(f"  \u23f3 等对话框进入 Step B（最多 {CLAIM_TIMEOUT}s）...")
+    cd = dialog_countdown(sb)
+    wait_ready = CLAIM_TIMEOUT if not cd else min(max(CLAIM_TIMEOUT, cd + 60), 600)
+    print(f"    （数字倒计时 {cd}s → 最多等 {wait_ready}s；无倒计时则纯文字等待）")
+    st = wait_modal_state(sb, "ready", wait_ready)
+    if st == "cooldown":
+        return "cooldown"
+    if st == "ready":
+        return "ready"
+    return st if st else "not-ready"
+
+
 def wait_claim_ready(sb, timeout):
     """Step B 专用的 Claim 等待：Turnstile 挂载→验证→按钮可用→点击。
 
@@ -1079,19 +1154,26 @@ def wait_claim_ready(sb, timeout):
     返回: 'clicked' / 'timeout' / 'cdp-dead' / 'dialog-closed' / 'cooldown' / 'turnstile-fail'
     """
     end = time.time() + timeout
-    bad_cdp = 0
+    bad_since = None
     n = 0
     while time.time() < end:
         n += 1
-        # —— 看门狗：JS 通道健康 ——
+        # —— 看门狗：JS 通道健康（容忍短暂卡死，持续超 CDP_RECOVER_WAIT 才判死） ——
         if js_health(sb) != "pong:2":
-            bad_cdp += 1
-            print(f"    ⚠️ JS 通道异常 ({bad_cdp}/3)，execute_script 可能已无响应")
-            if bad_cdp >= 3:
+            if bad_since is None:
+                bad_since = time.time()
+                print("    ⚠️ JS 通道无响应，等待恢复…")
+            waited = int(time.time() - bad_since)
+            if waited >= CDP_RECOVER_WAIT:
+                print(f"    ⚠️ JS 通道持续 {waited}s 无响应，判定中断")
                 return "cdp-dead"
-            time.sleep(2)
+            if waited % 15 == 0:
+                print(f"    …通道仍无响应（已 {waited}s）")
+            time.sleep(3)
             continue
-        bad_cdp = 0
+        if bad_since is not None:
+            print(f"    ✅ JS 通道恢复（中断约 {int(time.time() - bad_since)}s），继续")
+        bad_since = None
 
         st = detect_state(sb)
         if st == "closed":
@@ -1125,10 +1207,8 @@ def wait_claim_ready(sb, timeout):
             if n <= 3 or n % 5 == 0:
                 print(f"    Claim 仍 disabled（第 {n} 次），等验证/状态同步…")
         elif res == "js-null":
-            print(f"    ⚠️ Claim 查询返回空（第 {n} 次），通道抖动，已计数看门狗")
-            bad_cdp += 1
-            if bad_cdp >= 3:
-                return "cdp-dead"
+            if n <= 3 or n % 5 == 0:
+                print(f"    ⚠️ Claim 查询返回空（第 {n} 次），通道可能抖动，看门狗会处理")
         elif n <= 3 or n % 5 == 0:
             print(f"    （第 {n} 次 state={st!r} claim={res[:50]}）")
         time.sleep(TURNSTILE_POLL_INTERVAL)
@@ -1187,113 +1267,69 @@ def renew_one_server(sb, server_uuid: str) -> dict:
         print(f"  ⚡ ad-free 帐号：对话框里直接 Renew Now（{now_res}）")
         return read_renew_result(sb, sid, days_before)
 
-    # 2. 装 window.open 垫片 → 点 Read Article
-    #    面板靠 window.open('about:blank') 开文章页；JS 合成 click 冇 user activation，
-    #    Chrome 直接拦截 → window.open 返 null → 面板弹「Please allow pop-ups」并永远停在
-    #    confirm 状态（run 35450777798 实证：按钮点中咗，但对话框文字冇变、冇新标签）。
-    #    垫片返一个假 window 令面板状态机行得落去；真文章页由 Python 侧用 CDP 开。
-    print("  🩹 装 window.open 垫片...")
-    try:
-        print("    ", sb.execute_script(_JS_PATCH_WINDOW_OPEN))
-    except Exception as e:
-        print("  ⚠️ 垫片失败:", str(e)[:80])
-    try:
-        print("    XHR 诊断钩:", sb.execute_script(_JS_PATCH_XHR))
-    except Exception as e:
-        print("  ⚠️ XHR 钩失败:", str(e)[:80])
+    # 2+3. 文章 → Step B → Claim（最多 2 轮；第 2 轮用于通道中断/超时后的完整重试。
+    #    2026-10-03 run 37126904215：Step B 开始时 JS 通道卡死约 1 分钟后自行恢复，
+    #    看门狗已改为耐心等 90s；若仍失败，第二轮会关对话框、重开、完整重做一次，
+    #    而不是只等（旧恢复逻辑漏了重点 Read Article 的 bug 已修）。）
+    for attempt in (1, 2):
+        if attempt == 2:
+            print("  \U0001f504 第二轮：重开对话框，完整重做一次…")
+            try:
+                click_by_text(sb, "cancel", timeout=5)
+            except Exception:
+                pass
+            time.sleep(3)
+            reopen = open_renew_dialog(sb, timeout=20)
+            if reopen == "limit":
+                return {"status": "\u23ed\ufe0f 跳过", "message": "已达续期上限（Renew Limit Reached）"}
+            if reopen != "ok":
+                return {"status": "❌ 续期失败", "message": "第二轮重开续期对话框失败"}
+            time.sleep(3)
+            if "you renewed recently" in page_text(sb):
+                return {"status": "\u23ed\ufe0f 跳过", "message": "刚续期过，对话框显示冷却中（You renewed recently）"}
 
-    print("  🖱️ 点 Read Article...")
-    read_res = click_by_text(sb, "read article", timeout=15)
-    print(f"    {read_res}")
-    time.sleep(2)
+        art = _article_to_ready(sb, sid)
+        if art == "cooldown":
+            return {"status": "\u23ed\ufe0f 跳过", "message": "刚续期过，对话框显示冷却中（You renewed recently）"}
+        if art != "ready":
+            if attempt == 1:
+                print(f"  \u26a0\ufe0f 第一轮文章步骤未完成（{art}），进第二轮重试…")
+                continue
+            if art == "confirm":
+                sb.save_screenshot(f"stuck_confirm_{sid}.png")
+                return {"status": "❌ 续期失败", "message": "对话框卡在 confirm（Read Article 未生效/弹窗被拦）"}
+            return {"status": "❌ 续期失败", "message": f"两轮都到不了 Step B（{art}）"}
 
-    # 2b. 等面板 POST /renew/begin 返文章 URL，再真开一个标签去读
-    art_url = ""
-    for _ in range(20):
-        try:
-            art_url = str(sb.execute_script(_JS_GET_ARTICLE_URL) or "")
-        except Exception:
-            art_url = ""
-        if art_url.startswith("http"):
-            break
-        time.sleep(1)
-    # 2b. 唔开真标签：文章页係第三方站（albeu.com），面板根本核验唔到「有冇真读过」，
-    #     而且 Target.createTarget 会搞烂 CDP/pydoll 连線 —— 之后所有 execute_script 静默返 None
-    #     （run 35452477886 实证：js_health 由 'pong:2' 变 None，click 全部误报 not-found）。
-    #     倒计时係面板自己嘅 setInterval，只认佢自己 window.open 返嚟嘅假 window，
-    #     所以照等就得。真要去访问一次文章页，用页面内 fetch 就够。
-    if art_url.startswith("http"):
-        try:
-            sb.execute_script(
-                "(function(){try{fetch(%s,{credentials:'include',mode:'no-cors'})"
-                ".catch(function(){})}catch(e){}return 'fetched'})()" % json.dumps(art_url)
-            )
-            print("    📄 已用页面内 fetch 触发一次文章请求（唔开新标签）")
-        except Exception as e:
-            print(f"    （fetch 文章页失败，唔影响倒计时: {str(e)[:60]}）")
-    else:
-        print(f"  ⚠️ 未拿到文章 URL（面板可能仍在 confirm），read_res={read_res}")
-
-    # 2c. 等对话框走到 Step B（"Thanks for reading!"）。
-    #     2026-10-03 真机：新版对话框无数字倒计时，Step A 文案只说 "read it for a few seconds"；
-    #     旧版数字倒计时（"claim your renewal in N"）若出现仍兼容。
-    print(f"  ⏳ 等对话框进入 Step B（最多 {CLAIM_TIMEOUT}s）...")
-    cd = dialog_countdown(sb)
-    wait_ready = CLAIM_TIMEOUT if not cd else min(max(CLAIM_TIMEOUT, cd + 60), 600)
-    print(f"    （数字倒计时 {cd}s → 最多等 {wait_ready}s；无倒计时则纯文字等待）")
-    st = wait_modal_state(sb, "ready", wait_ready)
-    if st == "cooldown":
-        return {"status": "\u23ed\ufe0f 跳过", "message": "刚续期过，对话框显示冷却中（You renewed recently）"}
-    if st == "confirm":
-        sb.save_screenshot(f"stuck_confirm_{sid}.png")
-        return {"status": "\u274c 续期失败", "message": "对话框卡在 confirm（Read Article 未生效/弹窗被拦）"}
-
-    # 3. Step B：Turnstile 挂载→验证→Claim Renewal 可用→点击（带 CDP 看门狗）
-    #    2026-10-03 真机结论：Turnstile 只在 Step B 出现；旧代码在此盲轮询 600 秒。
-    print("  ⏳ Step B：等 Turnstile 挂载并点击 Claim Renewal…")
-    res = wait_claim_ready(sb, CLAIM_TIMEOUT)
-    if res == "clicked":
-        pass  # 落去读结果
-    elif res == "cooldown":
-        return {"status": "⏭️ 跳过", "message": "刚续期过，对话框显示冷却中（You renewed recently）"}
-    elif res == "turnstile-fail":
-        sb.save_screenshot(f"turnstile_fail_{sid}.png")
-        return {"status": "❌ 续期失败", "message": f"Turnstile 验证 {TURNSTILE_MAX_ATTEMPTS} 次未通过"}
-    elif res == "cdp-dead":
-        # JS 通道中断：尝试关对话框重开恢复一次（10-02 故障模式）
-        print("  🔄 JS 通道中断，尝试关闭重开对话框恢复…")
-        try:
-            click_by_text(sb, "cancel", timeout=5)
-        except Exception:
-            pass
-        time.sleep(2)
-        if open_renew_dialog(sb, timeout=20) == "ok":
-            st2 = wait_modal_state(sb, "ready", 120, note="（恢复后重等 Step B）")
-            if st2 == "ready":
-                res2 = wait_claim_ready(sb, min(CLAIM_TIMEOUT, 180))
-                if res2 == "clicked":
-                    return read_renew_result(sb, sid, days_before)
-                print(f"  ⚠️ 恢复后仍未点到 Claim（{res2}）")
-        sb.save_screenshot(f"cdp_dead_{sid}.png")
-        return {"status": "❌ 续期失败", "message": "页面 JS 通道中断且恢复失败（CDP 无响应），请人工检查后重跑"}
-    elif res == "dialog-closed":
-        sb.save_screenshot(f"dialog_closed_{sid}.png")
-        return {"status": "❌ 续期失败", "message": "等待期间续期对话框被关闭/消失，未能点击 Claim"}
-    else:  # timeout：Turnstile 未挂载或按钮持续 disabled
+        cres = wait_claim_ready(sb, CLAIM_TIMEOUT if attempt == 1 else min(CLAIM_TIMEOUT, 240))
+        if cres == "clicked":
+            return read_renew_result(sb, sid, days_before)
+        if cres == "cooldown":
+            return {"status": "\u23ed\ufe0f 跳过", "message": "刚续期过，对话框显示冷却中（You renewed recently）"}
+        if cres == "turnstile-fail":
+            sb.save_screenshot(f"turnstile_fail_{sid}.png")
+            return {"status": "❌ 续期失败", "message": f"Turnstile 验证 {TURNSTILE_MAX_ATTEMPTS} 次未通过"}
+        if attempt == 1 and cres in ("cdp-dead", "dialog-closed", "timeout"):
+            print(f"  \u26a0\ufe0f 第一轮 Claim 阶段异常（{cres}），进第二轮完整重试…")
+            continue
+        if cres == "cdp-dead":
+            sb.save_screenshot(f"cdp_dead_{sid}.png")
+            return {"status": "❌ 续期失败", "message": "页面 JS 通道中断且两轮恢复都失败（CDP 无响应），请人工检查后重跑"}
+        if cres == "dialog-closed":
+            sb.save_screenshot(f"dialog_closed_{sid}.png")
+            return {"status": "❌ 续期失败", "message": "等待期间续期对话框被关闭/消失，未能点击 Claim"}
         sb.save_screenshot(f"no_claim_btn_{sid}.png")
         try:
             js = ("(function(){var els=document.querySelectorAll('button,a,[role=button]');"
                   "var o=[];for(var i=0;i<els.length;i++){var t=(els[i].textContent||'')"
                   ".trim().slice(0,30);if(t)o.push(els[i].tagName+'['+t+']')}"
                   "return o.join(' | ')})()")
-            print(f"    🧾 超时前按钮文案: {str(sb.execute_script(js))[:600]}")
+            print(f"    \U0001f9fe 超时前按钮文案: {str(sb.execute_script(js))[:600]}")
         except Exception as e:
             print(f"    按钮枚举失败: {str(e)[:80]}")
         return {"status": "❌ 续期失败",
                 "message": "等唔到可点嘅 Claim Renewal（Turnstile 未挂载或按钮持续 disabled，面板结构可能又变了）"}
 
-    # 6. 读结果
-    return read_renew_result(sb, sid, days_before)
+    return {"status": "❌ 续期失败", "message": "两轮重试均未完成（未知）"}
 
 
 def fmt_msg(status, label, server_uuid, detail):
