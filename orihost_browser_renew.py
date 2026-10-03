@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Orihost 浏览器自动续期（SeleniumBase + 真浏览器）
+# v8 2026-10-03 run 37128070946 复盘追加：
+#   - run 37128070946（v7 脚本）两轮都在「倒计时 14→2 走完、进入 Step B 的瞬间」
+#     JS 通道冻结，且两次 90 秒都没恢复（v7 的 CDP_RECOVER_WAIT=90 不够）。
+#     看门狗放宽到 150s。冻结恰好发生在 Turnstile 挂载时刻，疑似 Cloudflare 在
+#     数据中心 IP 上的挑战/重载把主线程占满；根因未实证，仍在排查。
+#   - 失败截图实证：Step B 时新的「Download is ready」广告弹层会重新出现、正好
+#     压住 Turnstile 区域，且底部有 "We use cookies / Got it" 横幅。v7 只在点
+#     Read Article 前清广告，Step B 没清。清理函数现同时点掉 cookie 横幅。
+#   - wait_modal_state 也加耐心看门狗：读状态阶段若通道冻结超限，直接返回
+#     "cdp-dead"，不再盲轮询 600 秒烧光 Claim 预算。
 # v7 2026-10-03 run 37126904215 复盘追加：
-#   - Step B 开始时页面 JS 通道会卡死约 1 分钟后自行恢复（疑似 Turnstile 挂载时
-#     Cloudflare 在数据中心 IP 上做挑战/重载）。看门狗改成耐心等 90s（CDP_RECOVER_WAIT），
+#   - Step B 开始时页面 JS 通道会冻结（该次约 1 分钟后自行恢复；但 run 37128070946
+#     证明冻结可能超过 90 秒）。疑似 Turnstile 挂载时 Cloudflare 在数据中心 IP 上
+#     做挑战/重载——仅为推测，未实证。看门狗改成耐心等（CDP_RECOVER_WAIT，默认 150s），
 #     不再 3 次就判死，避免误杀可恢复的抖动。
 #   - 主流程改成最多 2 轮完整重试：文章→Step B→Claim 整轮重做；旧恢复逻辑漏了
 #     重开后重点 Read Article 的 bug 已修（_article_to_ready 抽成复用函数）。
@@ -58,7 +69,8 @@ TURNSTILE_WIDGET_WAIT = max(10, int(os.environ.get("TURNSTILE_WIDGET_WAIT") or "
 # JS 通道抖动恢复等待：Step B 挂载 Turnstile 时 Cloudflare 可能让页面卡住几十秒
 # （2026-10-03 run 37126904215 实证：通道卡死约 1 分钟后自行恢复）；
 # 通道持续无响应超过此时长才判死，不再 3 次就判死
-CDP_RECOVER_WAIT = max(30, int(os.environ.get("CDP_RECOVER_WAIT") or "90"))
+# （run 37128070946：Step B 切换瞬间冻结，两次 90s 都没恢复，故默认 150s）
+CDP_RECOVER_WAIT = max(30, int(os.environ.get("CDP_RECOVER_WAIT") or "150"))
 
 # ---------- 代理 ----------
 # 优先级：ORIHOST_PROXY 显式指定 > 工作流 sing-box（IS_PROXY/PROXY_SERVER，由 NODE_LINK 转出）
@@ -223,6 +235,7 @@ _JS_KILL_AD = """
  var els=document.querySelectorAll('body > *,body > * > *,body > * > * > *');
  for(var n=0;n<els.length;n++){var e=els[n],st3=getComputedStyle(e),z2=parseInt(st3.zIndex||'0',10);if(st3.position!=='fixed'&&st3.position!=='absolute'&&st3.position!=='sticky')continue;if(z2<900)continue;var r=e.getBoundingClientRect();if(r.width*r.height<0.12*innerWidth*innerHeight)continue;if(e.closest&&e.closest('[role="dialog"]'))continue;var txt=((e.innerText||e.textContent)+'').toLowerCase(),cls=((e.className||'')+'').toLowerCase();var keep=txt.indexOf('renew your server')>=0||txt.indexOf('claim renewal')>=0||cls.indexOf('turnstile')>=0||cls.indexOf('modal')>=0||e.querySelector('input[name="cf-turnstile-response"]')||e.querySelector('iframe[src*="challenges.cloudflare.com"]');if(!keep)hide(e,'zindex'+z2)}
  try{document.documentElement.style.removeProperty('overflow');document.body.style.removeProperty('overflow')}catch(e){}
+ try{var cands=document.querySelectorAll('button,[role="button"],a');for(var ci=0;ci<cands.length;ci++){var cb=cands[ci],bt=((cb.textContent||'').trim().toLowerCase());if(bt!=='got it'&&bt!=='accept'&&bt!=='accept all')continue;var br=cb.getBoundingClientRect();if(br.width<30||br.height<20)continue;if(br.top<innerHeight*0.55)continue;var btxt='';try{var pc=cb.closest('div');btxt=pc?String(pc.textContent||'').toLowerCase():''}catch(e2){}if(btxt.indexOf('cookie')<0)continue;cb.click();out.push('cookie:got-it');break}}catch(e){}
  return out.join(' ')||'none';
 })()
 """
@@ -951,12 +964,32 @@ def print_diag(sb, tag=""):
 
 
 def wait_modal_state(sb, target, timeout, note=""):
-    """等 Renew 对话框走到指定状态（confirm → reading → ready/closed）"""
+    """等 Renew 对话框走到指定状态（confirm → reading → ready/closed）。
+
+    带耐心看门狗：读状态阶段也可能撞上 Step B 切换瞬间的通道冻结，
+    冻结超 CDP_RECOVER_WAIT 直接返回 "cdp-dead"，不再盲轮询烧光预算。
+    """
     end = time.time() + timeout
     last = ""
     polls = 0
+    bad_since = None
     while time.time() < end:
         polls += 1
+        if js_health(sb) != "pong:2":
+            if bad_since is None:
+                bad_since = time.time()
+                print("    ⚠️ 读状态时 JS 通道无响应，等待恢复…")
+            waited = int(time.time() - bad_since)
+            if waited >= CDP_RECOVER_WAIT:
+                print(f"    ⚠️ JS 通道持续 {waited}s 无响应，判定中断")
+                return "cdp-dead"
+            if waited % 15 == 0:
+                print(f"    …通道仍无响应（已 {waited}s）")
+            time.sleep(3)
+            continue
+        if bad_since is not None:
+            print(f"    ✅ JS 通道恢复（中断约 {int(time.time() - bad_since)}s），继续")
+        bad_since = None
         last = detect_state(sb)
         if last == target:
             return last
@@ -1084,7 +1117,8 @@ def save_rotated_cookies(sb):
 def _article_to_ready(sb, sid):
     """点 Read Article → 等对话框进入 Step B（"Thanks for reading!"）。
 
-    返回: "ready" / "cooldown"（刚续期过）/ 其他状态字符串（"confirm"/"not-ready" 等）。
+    返回: "ready" / "cooldown"（刚续期过）/ "cdp-dead"（读状态时通道冻结超限）
+          / 其他状态字符串（"confirm"/"not-ready" 等）。
     设计成可复用：主流程第一轮用，CDP 中断恢复的第二轮也调它（2026-10-03 run 37126904215
     教训：恢复时只重开了对话框、没重点 Read Article，导致永远卡在 Step A）。
     """
@@ -1291,6 +1325,12 @@ def renew_one_server(sb, server_uuid: str) -> dict:
         art = _article_to_ready(sb, sid)
         if art == "cooldown":
             return {"status": "\u23ed\ufe0f 跳过", "message": "刚续期过，对话框显示冷却中（You renewed recently）"}
+        if art == "cdp-dead":
+            if attempt == 1:
+                print("  ⚠️ 第一轮读状态时 JS 通道中断，进第二轮重试…")
+                continue
+            sb.save_screenshot(f"cdp_dead_{sid}.png")
+            return {"status": "❌ 续期失败", "message": "页面 JS 通道中断且两轮恢复都失败（CDP 无响应），请人工检查后重跑"}
         if art != "ready":
             if attempt == 1:
                 print(f"  \u26a0\ufe0f 第一轮文章步骤未完成（{art}），进第二轮重试…")
