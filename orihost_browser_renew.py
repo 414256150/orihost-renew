@@ -1,10 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Orihost 浏览器自动续期（SeleniumBase + 真浏览器）
-# v5 广告弹层点击关闭 + 组件挂载等待版：保留 remember_web Cookie 登录与轮换
+# v6 2026-10-03 按真实页面重写 Claim 阶段：保留 remember_web Cookie 登录与轮换
 # 背景：面板 claim 接口强制要求 Cloudflare Turnstile token（GET /api/client/renewal/complete?cf-turnstile-response=xxx），
 #       纯 HTTP 调不通（无 token 直接 500），必须用真浏览器点验证。
-# 流程：Cookie 免登 → 服务器页 → Renew → Read Article → 倒计时 → 关广告/清覆盖层 → 等组件挂载 → Turnstile → Claim Renewal
+# 流程：Cookie 免登 → 服务器页 → Renew → Read Article → 等 "Thanks for reading!"（Step B）
+#       → 等 Turnstile 挂载 → 验证 → Claim Renewal 变可用 → 点击 → 读 API 结果
+# 2026-10-03 真机实测（面板 built on Jexactyl）：
+#   - 对话框 Step A：h2 "Renew your server"，文案 "Click Read Article to open a news article
+#     in a new tab. Keep it open and read it for a few seconds, then return here to claim
+#     your renewal (+7 days)."，按钮 Cancel / Read Article（可用），无 Turnstile，无数字倒计时。
+#   - 点 Read Article 会在新标签打开 albeu.com 文章；文章开 30~60 秒、关闭并回到面板页后，
+#     对话框变 Step B："Thanks for reading! Click Claim Renewal to add up to +7 days…"。
+#   - Step B 才挂载 Turnstile（iframe + input[name=cf-turnstile-response]），Claim Renewal
+#     为 disabled，验证通过后才可用。Step B 之前轮询 Turnstile 是等不到的。
+#   - 广告："Download is ready / Tap to proceed" 弹窗 iframe 可能盖住 Renew 入口按钮；
+#     kill_ad_overlay 已加 role=dialog 豁免，绝不隐藏续期对话框本身。
+#   - 10-02 失败复盘：对话框已到 ready 但 Turnstile 始终未挂载、Claim 查询 600 秒全 js-null
+#     （疑似 CDP 通道抖动/中断），旧代码盲轮询。本版加 CDP 健康看门狗：连续 3 次 js_health
+#     异常即判定通道中断，尝试关对话框重开恢复一次；仍失败则明确报错，不再盲等。
 # 参考：katabump-renew-main（同款 Turnstile 处理 + xvfb 无头方案）
 
 import json
@@ -187,7 +201,7 @@ _HAS_TURNSTILE_JS = """
 _JS_KILL_AD = """
 (function(){
  var out=[];
- function hide(el,why){try{el.style.setProperty('display','none','important');el.style.setProperty('visibility','hidden','important');el.style.setProperty('pointer-events','none','important');out.push(why+':'+el.tagName)}catch(e){}}
+ function hide(el,why){try{if(el.closest&&el.closest('[role="dialog"]')){out.push('skip-dialog:'+el.tagName);return}el.style.setProperty('display','none','important');el.style.setProperty('visibility','hidden','important');el.style.setProperty('pointer-events','none','important');out.push(why+':'+el.tagName)}catch(e){}}
  var markers=['download is ready','tap to proceed','continue to download','your download is ready'];
  var all=document.querySelectorAll('div,section,aside,iframe,ins');
  for(var i=0;i<all.length;i++){var el=all[i],t=((el.innerText||el.textContent)||'').toLowerCase().slice(0,500);if(!t)continue;for(var j=0;j<markers.length;j++){if(t.indexOf(markers[j])<0)continue;var p=el;for(var k=0;k<10&&p.parentElement;k++){var st=getComputedStyle(p),z=parseInt(st.zIndex||'0',10);if(st.position==='fixed'||st.position==='sticky'||z>=100)break;p=p.parentElement}hide(p,'marker');break}}
@@ -195,9 +209,9 @@ _JS_KILL_AD = """
  if(ts){var tr=null,e2=ts;
   for(var m=0;m<10&&e2.parentElement;m++){e2=e2.parentElement;var r0=e2.getBoundingClientRect();if(r0.width>=200&&r0.height>=40){tr=r0;break}}
   if(tr){var pts=[[tr.left+tr.width/2,tr.top+tr.height/2],[tr.left+24,tr.top+tr.height/2],[tr.left+tr.width-24,tr.top+tr.height/2],[tr.left+tr.width/2,tr.top+12],[tr.left+tr.width/2,tr.bottom-8]];
-   for(var q=0;q<pts.length;q++){var top=document.elementFromPoint(pts[q][0],pts[q][1]);if(!top)continue;if(top===ts)continue;if((top.tagName==='IFRAME')&&(top.src||'').indexOf('challenges.cloudflare.com')>=0)continue;if(top.contains(ts)||ts.contains(top))continue;var t2=top;for(var w=0;w<8&&t2.parentElement;w++){var st2=getComputedStyle(t2);if(st2.position==='fixed'||st2.position==='absolute'||st2.position==='sticky'||parseInt(st2.zIndex||'0',10)>=100)break;t2=t2.parentElement}hide(t2,'cover'+q)}}}
+   for(var q=0;q<pts.length;q++){var top=document.elementFromPoint(pts[q][0],pts[q][1]);if(!top)continue;if(top===ts)continue;if((top.tagName==='IFRAME')&&(top.src||'').indexOf('challenges.cloudflare.com')>=0)continue;if(top.contains(ts)||ts.contains(top))continue;var t2=top;for(var w=0;w<8&&t2.parentElement;w++){var st2=getComputedStyle(t2);if(st2.position==='fixed'||st2.position==='absolute'||st2.position==='sticky'||parseInt(st2.zIndex||'0',10)>=100)break;t2=t2.parentElement}if(t2.closest&&t2.closest('[role="dialog"]'))continue;hide(t2,'cover'+q)}}}
  var els=document.querySelectorAll('body > *,body > * > *,body > * > * > *');
- for(var n=0;n<els.length;n++){var e=els[n],st3=getComputedStyle(e),z2=parseInt(st3.zIndex||'0',10);if(st3.position!=='fixed'&&st3.position!=='absolute'&&st3.position!=='sticky')continue;if(z2<900)continue;var r=e.getBoundingClientRect();if(r.width*r.height<0.12*innerWidth*innerHeight)continue;var txt=((e.innerText||e.textContent)+'').toLowerCase(),cls=((e.className||'')+'').toLowerCase();var keep=txt.indexOf('renew your server')>=0||txt.indexOf('claim renewal')>=0||cls.indexOf('turnstile')>=0||cls.indexOf('modal')>=0||e.querySelector('input[name="cf-turnstile-response"]')||e.querySelector('iframe[src*="challenges.cloudflare.com"]');if(!keep)hide(e,'zindex'+z2)}
+ for(var n=0;n<els.length;n++){var e=els[n],st3=getComputedStyle(e),z2=parseInt(st3.zIndex||'0',10);if(st3.position!=='fixed'&&st3.position!=='absolute'&&st3.position!=='sticky')continue;if(z2<900)continue;var r=e.getBoundingClientRect();if(r.width*r.height<0.12*innerWidth*innerHeight)continue;if(e.closest&&e.closest('[role="dialog"]'))continue;var txt=((e.innerText||e.textContent)+'').toLowerCase(),cls=((e.className||'')+'').toLowerCase();var keep=txt.indexOf('renew your server')>=0||txt.indexOf('claim renewal')>=0||cls.indexOf('turnstile')>=0||cls.indexOf('modal')>=0||e.querySelector('input[name="cf-turnstile-response"]')||e.querySelector('iframe[src*="challenges.cloudflare.com"]');if(!keep)hide(e,'zindex'+z2)}
  try{document.documentElement.style.removeProperty('overflow');document.body.style.removeProperty('overflow')}catch(e){}
  return out.join(' ')||'none';
 })()
@@ -1056,6 +1070,71 @@ def save_rotated_cookies(sb):
         print(f"  ⚠️ 写回 secret 失败（不影响续期）: {str(e)[:120]}")
 
 
+def wait_claim_ready(sb, timeout):
+    """Step B 专用的 Claim 等待：Turnstile 挂载→验证→按钮可用→点击。
+
+    2026-10-03 真机结论：Turnstile 只在 Step B（"Thanks for reading!" 之后）挂载；
+    在此之前轮询它永远等不到。Claim Renewal 在验证通过前是 disabled。
+    带 CDP 健康看门狗：连续 3 次 js_health 异常即判通道中断，不再盲轮询。
+    返回: 'clicked' / 'timeout' / 'cdp-dead' / 'dialog-closed' / 'cooldown' / 'turnstile-fail'
+    """
+    end = time.time() + timeout
+    bad_cdp = 0
+    n = 0
+    while time.time() < end:
+        n += 1
+        # —— 看门狗：JS 通道健康 ——
+        if js_health(sb) != "pong:2":
+            bad_cdp += 1
+            print(f"    ⚠️ JS 通道异常 ({bad_cdp}/3)，execute_script 可能已无响应")
+            if bad_cdp >= 3:
+                return "cdp-dead"
+            time.sleep(2)
+            continue
+        bad_cdp = 0
+
+        st = detect_state(sb)
+        if st == "closed":
+            return "dialog-closed"
+        if st == "cooldown":
+            return "cooldown"
+
+        rep = kill_ad_overlay(sb)
+        if n <= 2:
+            print(f"    🧹 广告清理: {rep[:160]}")
+
+        # —— Step B 才会有 Turnstile；有就先验证 ——
+        try:
+            has_ts = bool(sb.execute_script(_HAS_TURNSTILE_JS))
+        except Exception:
+            has_ts = False
+        if has_ts:
+            print("    🔐 检测到 Turnstile，先完成验证")
+            ts_state = handle_turnstile(sb)
+            if ts_state is False:
+                return "turnstile-fail"
+            # None = 组件闪了一下又没了/没挂载稳，不算失败，继续去探 Claim
+            time.sleep(1)
+
+        # —— 探 Claim Renewal ——
+        res = str(click_by_text(sb, "claim renewal", timeout=6))
+        if res.startswith("clicked"):
+            print(f"    🖱️ 点 Claim Renewal: {res[:60]}")
+            return "clicked"
+        if res.startswith("disabled"):
+            if n <= 3 or n % 5 == 0:
+                print(f"    Claim 仍 disabled（第 {n} 次），等验证/状态同步…")
+        elif res == "js-null":
+            print(f"    ⚠️ Claim 查询返回空（第 {n} 次），通道抖动，已计数看门狗")
+            bad_cdp += 1
+            if bad_cdp >= 3:
+                return "cdp-dead"
+        elif n <= 3 or n % 5 == 0:
+            print(f"    （第 {n} 次 state={st!r} claim={res[:50]}）")
+        time.sleep(TURNSTILE_POLL_INTERVAL)
+    return "timeout"
+
+
 # ---------- 单台续期 ----------
 def renew_one_server(sb, server_uuid: str) -> dict:
     sid = (server_uuid or "").split("-")[0][:8]
@@ -1155,11 +1234,13 @@ def renew_one_server(sb, server_uuid: str) -> dict:
     else:
         print(f"  ⚠️ 未拿到文章 URL（面板可能仍在 confirm），read_res={read_res}")
 
-    # 2c. 等对话框由 reading 走到 ready（dwell 秒数由面板自己数）
-    print(f"  ⏳ 等文章停留倒计时（最多 {CLAIM_TIMEOUT}s）...")
+    # 2c. 等对话框走到 Step B（"Thanks for reading!"）。
+    #     2026-10-03 真机：新版对话框无数字倒计时，Step A 文案只说 "read it for a few seconds"；
+    #     旧版数字倒计时（"claim your renewal in N"）若出现仍兼容。
+    print(f"  ⏳ 等对话框进入 Step B（最多 {CLAIM_TIMEOUT}s）...")
     cd = dialog_countdown(sb)
     wait_ready = CLAIM_TIMEOUT if not cd else min(max(CLAIM_TIMEOUT, cd + 60), 600)
-    print(f"    （面板报倒计时 {cd}s → 最多等 {wait_ready}s）")
+    print(f"    （数字倒计时 {cd}s → 最多等 {wait_ready}s；无倒计时则纯文字等待）")
     st = wait_modal_state(sb, "ready", wait_ready)
     if st == "cooldown":
         return {"status": "\u23ed\ufe0f 跳过", "message": "刚续期过，对话框显示冷却中（You renewed recently）"}
@@ -1167,70 +1248,49 @@ def renew_one_server(sb, server_uuid: str) -> dict:
         sb.save_screenshot(f"stuck_confirm_{sid}.png")
         return {"status": "\u274c 续期失败", "message": "对话框卡在 confirm（Read Article 未生效/弹窗被拦）"}
 
-    # 3. 先完成 Turnstile，再点 Claim Renewal
-    print("  ⏳ 检查 Turnstile / Claim Renewal...")
-    ts_state = None
-    clicked = False
-    n_try = 0
-    deadline = time.time() + CLAIM_TIMEOUT
-
-    while time.time() < deadline:
-        kill_ad_overlay(sb)   # 先点掉/清掉广告遮罩，再检测/点击
-        # 第一步：如果页面有 Turnstile，必须先拿到 token。
+    # 3. Step B：Turnstile 挂载→验证→Claim Renewal 可用→点击（带 CDP 看门狗）
+    #    2026-10-03 真机结论：Turnstile 只在 Step B 出现；旧代码在此盲轮询 600 秒。
+    print("  ⏳ Step B：等 Turnstile 挂载并点击 Claim Renewal…")
+    res = wait_claim_ready(sb, CLAIM_TIMEOUT)
+    if res == "clicked":
+        pass  # 落去读结果
+    elif res == "cooldown":
+        return {"status": "⏭️ 跳过", "message": "刚续期过，对话框显示冷却中（You renewed recently）"}
+    elif res == "turnstile-fail":
+        sb.save_screenshot(f"turnstile_fail_{sid}.png")
+        return {"status": "❌ 续期失败", "message": f"Turnstile 验证 {TURNSTILE_MAX_ATTEMPTS} 次未通过"}
+    elif res == "cdp-dead":
+        # JS 通道中断：尝试关对话框重开恢复一次（10-02 故障模式）
+        print("  🔄 JS 通道中断，尝试关闭重开对话框恢复…")
         try:
-            has_ts = bool(sb.execute_script(_HAS_TURNSTILE_JS))
+            click_by_text(sb, "cancel", timeout=5)
         except Exception:
-            has_ts = False
-
-        if has_ts and ts_state is not True:
-            print("  🔐 检测到 Turnstile，先完成验证")
-            ts_state = handle_turnstile(sb)
-            if ts_state is False:
-                sb.save_screenshot(f"turnstile_fail_{sid}.png")
-                return {"status": "❌ 续期失败", "message": f"Turnstile 验证 {TURNSTILE_MAX_ATTEMPTS} 次未通过"}
-            # ts_state 为 None（组件一直没挂载）唔算失败，落去照点 Claim
-            time.sleep(1)
-
-        # 第二步：等待 Claim 按钮解除 disabled，再点击。
-        enable_deadline = min(deadline, time.time() + CLAIM_ENABLE_WAIT)
-        while time.time() < enable_deadline:
-            res = click_by_text(sb, "claim renewal", timeout=6)
-            sres = str(res)
-            if sres.startswith("clicked"):
-                print(f"  🖱️ 点 Claim Renewal: {sres}")
-                clicked = True
-                break
-
-            if sres.startswith("disabled"):
-                print("    Claim Renewal 仍 disabled，继续等待 token/页面状态同步")
-            else:
-                n_try += 1
-                if n_try <= 4 or n_try % 6 == 0:
-                    print(f"    （第 {n_try} 次：state={detect_state(sb)!r} 倒计时={dialog_countdown(sb)} claim={sres[:50]}）")
-
-            # 如果 Cloudflare 重新渲染，重新处理。
-            try:
-                current_has_ts = bool(sb.execute_script(_HAS_TURNSTILE_JS))
-            except Exception:
-                current_has_ts = False
-            if current_has_ts and ts_state is not True:
-                ts_state = handle_turnstile(sb)
-                if ts_state is False:
-                    sb.save_screenshot(f"turnstile_fail_{sid}.png")
-                    return {"status": "❌ 续期失败", "message": f"Turnstile 验证 {TURNSTILE_MAX_ATTEMPTS} 次未通过"}
-
-            time.sleep(TURNSTILE_POLL_INTERVAL)
-
-        if clicked:
-            break
-
-        # 没点到且总超时未到，再循环检查页面。
-        ts_state = None
-        time.sleep(1)
-
-    if not clicked:
+            pass
+        time.sleep(2)
+        if open_renew_dialog(sb, timeout=20) == "ok":
+            st2 = wait_modal_state(sb, "ready", 120, note="（恢复后重等 Step B）")
+            if st2 == "ready":
+                res2 = wait_claim_ready(sb, min(CLAIM_TIMEOUT, 180))
+                if res2 == "clicked":
+                    return read_renew_result(sb, sid, days_before)
+                print(f"  ⚠️ 恢复后仍未点到 Claim（{res2}）")
+        sb.save_screenshot(f"cdp_dead_{sid}.png")
+        return {"status": "❌ 续期失败", "message": "页面 JS 通道中断且恢复失败（CDP 无响应），请人工检查后重跑"}
+    elif res == "dialog-closed":
+        sb.save_screenshot(f"dialog_closed_{sid}.png")
+        return {"status": "❌ 续期失败", "message": "等待期间续期对话框被关闭/消失，未能点击 Claim"}
+    else:  # timeout：Turnstile 未挂载或按钮持续 disabled
         sb.save_screenshot(f"no_claim_btn_{sid}.png")
-        return {"status": "❌ 续期失败", "message": "等唔到可点嘅 Claim Renewal（倒计时/验证未完成）"}
+        try:
+            js = ("(function(){var els=document.querySelectorAll('button,a,[role=button]');"
+                  "var o=[];for(var i=0;i<els.length;i++){var t=(els[i].textContent||'')"
+                  ".trim().slice(0,30);if(t)o.push(els[i].tagName+'['+t+']')}"
+                  "return o.join(' | ')})()")
+            print(f"    🧾 超时前按钮文案: {str(sb.execute_script(js))[:600]}")
+        except Exception as e:
+            print(f"    按钮枚举失败: {str(e)[:80]}")
+        return {"status": "❌ 续期失败",
+                "message": "等唔到可点嘅 Claim Renewal（Turnstile 未挂载或按钮持续 disabled，面板结构可能又变了）"}
 
     # 6. 读结果
     return read_renew_result(sb, sid, days_before)
