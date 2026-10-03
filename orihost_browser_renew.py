@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Orihost 浏览器自动续期（SeleniumBase + 真浏览器）
+# v10 2026-10-03：在用户版（v8+load_accounts 多账号）上合入 v9 弹窗处理：
+#   - 新增 close_popup_windows：关掉续期主窗口之外的所有弹窗/广告标签页并切回
+#     panel.orihost.com（点 Read Article 后、Step B 轮询中、通道恢复后、点 Claim 前都调）。
+#   - kill_ad_overlay 先找广告弹层上真正的 Close/✕ 按钮坐标再点，找不到才用几何经验坐标。
+#     （之前按左下角盲点，点偏会点到 Continue 打开广告新窗口——用户实测反馈。）
 # v8 2026-10-03 run 37128070946 复盘追加：
-# v9 2026-10-03 用户实测反馈追加：
-#   - 用户观察：点开广告会打开新窗口。脚本新增 close_popup_windows：关掉续期页之外的
-#     所有弹窗/广告标签页并切回主窗口（在 Step B 轮询、通道恢复后、点 Claim 前都调）。
-#   - kill_ad_overlay 改成先找广告弹层上真正的 Close/✕ 按钮坐标再点（之前是按
-#     「左下角」经验坐标盲点，点偏就可能点到 Continue 打开广告新窗口）。
-#   - run 37128070946（v7 脚本）两轮都在「倒计时 14→2 走完、进入 Step B 的瞬间」
 #   - run 37128070946（v7 脚本）两轮都在「倒计时 14→2 走完、进入 Step B 的瞬间」
 #     JS 通道冻结，且两次 90 秒都没恢复（v7 的 CDP_RECOVER_WAIT=90 不够）。
 #     看门狗放宽到 150s。冻结恰好发生在 Turnstile 挂载时刻，疑似 Cloudflare 在
@@ -332,7 +331,7 @@ def close_popup_windows(sb, main_handle):
     closed = 0
     try:
         handles = list(sb.driver.window_handles)
-    except Exception as e:
+    except Exception:
         return 0, main_handle
     if len(handles) <= 1:
         return 0, main_handle
@@ -360,9 +359,9 @@ def close_popup_windows(sb, main_handle):
                 pass
             sb.driver.close()
             closed += 1
-            print(f"    🪟 关广告弹窗: {url[:90]}")
+            print(f"    \U0001fa9f 关广告弹窗: {url[:90]}")
         except Exception as e:
-            print(f"    ⚠️ 关弹窗失败: {str(e)[:60]}")
+            print(f"    \u26a0\ufe0f 关弹窗失败: {str(e)[:60]}")
     try:
         sb.driver.switch_to.window(main_handle)
     except Exception:
@@ -375,9 +374,8 @@ def kill_ad_overlay(sb):
     ① 定位覆盖层，用 CDP 点它自己的 Close（面板流程可能要求真关闭才肯挂验证组件）；
     ② 点唔走嘅再按几何位置藏掉（跨域 iframe 读唔到文字，纯文案匹配对佢无效）。
     只点 Close 唔点 Continue——Continue 係广告跳转按钮，点咗可能直接离开页面。
-    v9：先找弹层上真正的 Close/✕ 按钮坐标再点，找不到才用几何经验坐标兜底。"""
+    v10：先找弹层上真正的 Close/✕ 按钮坐标再点，找不到才用几何经验坐标兜底。"""
     report = []
-    # ① 精确打击：广告弹层上真正的 Close/✕ 按钮
     try:
         raw = sb.execute_script(_JS_FIND_AD_CLOSE)
         btns = json.loads(raw) if isinstance(raw, str) else []
@@ -392,7 +390,6 @@ def kill_ad_overlay(sb):
         res = ts_click_cdp(sb, cx, cy)
         report.append(f"真Close({int(cx)},{int(cy)})→{res}")
         time.sleep(1.2)
-    # ② 几何兜底：经验坐标（左下角）
     try:
         raw = sb.execute_script(_JS_AD_COVERS)
         covers = json.loads(raw) if isinstance(raw, str) else []
@@ -1063,7 +1060,6 @@ def wait_modal_state(sb, target, timeout, note="", main_handle=None):
 
     带耐心看门狗：读状态阶段也可能撞上 Step B 切换瞬间的通道冻结，
     冻结超 CDP_RECOVER_WAIT 直接返回 "cdp-dead"，不再盲轮询烧光预算。
-    每隔几轮顺手关一次广告弹窗并切回主窗口。
     """
     end = time.time() + timeout
     last = ""
@@ -1238,14 +1234,14 @@ def _article_to_ready(sb, sid, main_handle=None):
     print("  \U0001f5b1\ufe0f 点 Read Article...")
     read_res = click_by_text(sb, "read article", timeout=15)
     print(f"    {read_res}")
+    if not str(read_res).startswith("clicked"):
+        print(f"  \u26a0\ufe0f Read Article 未点中（{read_res}）")
+        return "confirm"
     if main_handle:
         try:
             n_closed, main_handle = close_popup_windows(sb, main_handle)
         except Exception as e:
-            print(f"    ⚠️ 关弹窗异常: {str(e)[:60]}")
-    if not str(read_res).startswith("clicked"):
-        print(f"  \u26a0\ufe0f Read Article 未点中（{read_res}）")
-        return "confirm"
+            print(f"    \u26a0\ufe0f 关弹窗异常: {str(e)[:60]}")
     time.sleep(2)
 
     # 等面板 POST /renew/begin 返文章 URL，用页面内 fetch 触发一次请求（唔开真标签；
@@ -1313,14 +1309,13 @@ def wait_claim_ready(sb, timeout, main_handle=None):
             continue
         if bad_since is not None:
             print(f"    ✅ JS 通道恢复（中断约 {int(time.time() - bad_since)}s），继续")
-            # 通道恢复后先关掉冻结期间可能弹出的广告窗口，切回续期页
             if main_handle:
                 try:
                     n_closed, main_handle = close_popup_windows(sb, main_handle)
                     if n_closed:
-                        print(f"    🪟 通道恢复后关掉 {n_closed} 个弹窗")
+                        print(f"    \U0001fa9f 通道恢复后关掉 {n_closed} 个弹窗")
                 except Exception as e:
-                    print(f"    ⚠️ 关弹窗异常: {str(e)[:60]}")
+                    print(f"    \u26a0\ufe0f 关弹窗异常: {str(e)[:60]}")
         bad_since = None
 
         st = detect_state(sb)
@@ -1332,7 +1327,6 @@ def wait_claim_ready(sb, timeout, main_handle=None):
         rep = kill_ad_overlay(sb)
         if n <= 2:
             print(f"    🧹 广告清理: {rep[:160]}")
-        # 每隔几轮顺手关一次广告弹窗（点偏 Close 点到 Continue 会开新窗口）
         if main_handle and n % 4 == 1:
             try:
                 n_closed, main_handle = close_popup_windows(sb, main_handle)
@@ -1426,9 +1420,9 @@ def renew_one_server(sb, server_uuid: str) -> dict:
         return read_renew_result(sb, sid, days_before)
 
     # 2+3. 文章 → Step B → Claim（最多 2 轮；第 2 轮用于通道中断/超时后的完整重试。
-    #    2026-10-03：Step B 切换瞬间 JS 通道会冻结（短则 1 分钟，长则超 90 秒），
-    #    看门狗耐心等 CDP_RECOVER_WAIT（默认 150s）；若仍失败，第二轮会关对话框、
-    #    重开、完整重做一次，而不是只等（旧恢复逻辑漏了重点 Read Article 的 bug 已修）。）
+    #    2026-10-03 run 37126904215：Step B 开始时 JS 通道卡死约 1 分钟后自行恢复，
+    #    看门狗已改为耐心等 90s；若仍失败，第二轮会关对话框、重开、完整重做一次，
+    #    而不是只等（旧恢复逻辑漏了重点 Read Article 的 bug 已修）。）
     for attempt in (1, 2):
         if attempt == 2:
             print("  \U0001f504 第二轮：重开对话框，完整重做一次…")
@@ -1465,7 +1459,6 @@ def renew_one_server(sb, server_uuid: str) -> dict:
             return {"status": "❌ 续期失败", "message": f"两轮都到不了 Step B（{art}）"}
 
         cres = wait_claim_ready(sb, CLAIM_TIMEOUT if attempt == 1 else min(CLAIM_TIMEOUT, 240), main_handle)
-        # 每轮 Claim 结束后顺手更新主窗口句柄（弹窗关闭可能换过）
         try:
             main_handle = sb.driver.current_window_handle
         except Exception:
