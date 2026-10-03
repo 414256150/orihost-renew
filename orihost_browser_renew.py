@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Orihost 浏览器自动续期（SeleniumBase + 真浏览器）
+# v11 2026-10-04：一行修复——js_health 的 repr() 比较 bug（见函数内注释）。
+#   之前所有版本的看门狗在通道健康时也判死，Step B/Turnstile/Claim 从未被真正尝试过。
 # v10 2026-10-03：在用户版（v8+load_accounts 多账号）上合入 v9 弹窗处理：
 #   - 新增 close_popup_windows：关掉续期主窗口之外的所有弹窗/广告标签页并切回
 #     panel.orihost.com（点 Read Article 后、Step B 轮询中、通道恢复后、点 Claim 前都调）。
@@ -1020,12 +1022,17 @@ def dialog_countdown(sb):
 
 
 def js_health(sb):
-    """CDP 模式下 createTarget 后 execute_script 可能静默返 None，先探一探"""
+    """CDP 模式下 createTarget 后 execute_script 可能静默返 None，先探一探。
+
+    2026-10-04 实锤修正：之前这里 return repr(v)，健康时返回的是 "'pong:2'"
+    （带引号），而看门狗比较的是 "pong:2"，导致健康也被判死。从 v6 起所有
+    "JS 通道无响应" 都是这次误报，页面根本没冻——特此纠正。
+    """
     try:
         v = sb.execute_script("(function(){return 'pong:' + (1+1)})()")
     except Exception as e:
         return "err:" + str(e)[:60]
-    return repr(v)
+    return "" if v is None else str(v)
 
 
 def detect_state(sb):
